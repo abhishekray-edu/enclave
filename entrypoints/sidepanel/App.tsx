@@ -17,14 +17,46 @@ import { buildMessages } from '@/lib/prompt';
 import { Markdown } from './Markdown';
 import { Logo } from './Logo';
 import { applyTheme } from '@/lib/theme';
-import { DEFAULT_SETTINGS, type ChatMessage, type PageContent, type PendingAction, type Settings, type Theme } from '@/lib/types';
+import {
+  DEFAULT_SETTINGS,
+  MAX_CONTEXT_TOKENS,
+  MIN_CONTEXT_TOKENS,
+  type ChatMessage,
+  type PageContent,
+  type PendingAction,
+  type Settings,
+  type Theme,
+} from '@/lib/types';
 
 const PENDING_KEY = 'pendingAction';
+const PAGE_CAPTURE_TIMEOUT_MS = 8_000;
+const FIRST_TOKEN_TIMEOUT_MS = 90_000;
+const NEXT_TOKEN_TIMEOUT_MS = 45_000;
+const AUTO_SCROLL_BOTTOM_PX = 48;
 
 // chrome.scripting isn't in the polyfill types; access the global directly.
 const scripting = (globalThis as unknown as {
   chrome: { scripting: { executeScript(opts: { target: { tabId: number }; files: string[] }): Promise<unknown> } };
 }).chrome.scripting;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string, onTimeout?: () => void): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      onTimeout?.();
+      reject(new Error(message));
+    }, ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
 
 /** Capture the active tab's content. If the content script isn't present (e.g. the tab was
  *  open before the extension was installed/updated), inject it on demand and retry. */
@@ -58,6 +90,30 @@ function stripThink(text: string): string {
   return out.replace(/^\s+/, '');
 }
 
+function contextForSettings(s: Settings): number {
+  return Math.max(MIN_CONTEXT_TOKENS, Math.min(s.webllmCtx, MAX_CONTEXT_TOKENS, webllmModel(s.webllmModel).maxCtx));
+}
+
+function isNearBottom(el: HTMLElement): boolean {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= AUTO_SCROLL_BOTTOM_PX;
+}
+
+function ThinkingIndicator() {
+  return (
+    <div className="thinking-indicator" role="status" aria-label="Thinking">
+      <span className="thinking-indicator__spinner" aria-hidden="true" />
+      <span className="thinking-indicator__label">
+        Thinking<span className="thinking-indicator__dots" aria-hidden="true" />
+      </span>
+      <span className="thinking-indicator__wave" aria-hidden="true">
+        <span />
+        <span />
+        <span />
+      </span>
+    </div>
+  );
+}
+
 export default function App() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -79,6 +135,7 @@ export default function App() {
   messagesRef.current = messages;
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
 
   // Initial load: settings, then any queued context-menu action.
   useEffect(() => {
@@ -102,12 +159,20 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
+    if (!shouldAutoScrollRef.current) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
   useEffect(() => {
     applyTheme(settings.theme);
   }, [settings.theme]);
+
+  useEffect(() => {
+    return () => {
+      cancelScheduledPreload();
+    };
+  }, []);
 
   /** Ensure the offscreen document exists and we hold a live port to it. */
   async function getWebllmPort(): Promise<WebllmPort> {
@@ -123,6 +188,7 @@ export default function App() {
 
   /** Free the model from memory by closing the offscreen document. */
   async function releaseModel() {
+    cancelScheduledPreload();
     portRef.current?.disconnect();
     portRef.current = null;
     await releaseOffscreen();
@@ -134,7 +200,7 @@ export default function App() {
     if (!webgpuAvailable() || abortRef.current) return;
     try {
       const port = await getWebllmPort();
-      await initModel(port, s.webllmModel, s.webllmCtx, (p) => setLoadProgress(p));
+      await initModel(port, s.webllmModel, contextForSettings(s), (p) => setLoadProgress(p));
     } catch {
       /* a real error surfaces on the next send */
     } finally {
@@ -144,8 +210,17 @@ export default function App() {
 
   /** Debounce reloads so editing the context number doesn't reload on every keystroke. */
   function schedulePreload(s: Settings) {
-    if (preloadTimerRef.current) clearTimeout(preloadTimerRef.current);
-    preloadTimerRef.current = setTimeout(() => void preloadModel(s), 700);
+    cancelScheduledPreload();
+    preloadTimerRef.current = setTimeout(() => {
+      preloadTimerRef.current = null;
+      void preloadModel(s);
+    }, 700);
+  }
+
+  function cancelScheduledPreload() {
+    if (!preloadTimerRef.current) return;
+    clearTimeout(preloadTimerRef.current);
+    preloadTimerRef.current = null;
   }
 
   function setLastAssistant(content: string) {
@@ -156,34 +231,54 @@ export default function App() {
     });
   }
 
+  function onChatScroll() {
+    const el = scrollRef.current;
+    if (el) shouldAutoScrollRef.current = isNearBottom(el);
+  }
+
   async function submit(text: string, opts?: { selectionOverride?: string }) {
     const trimmed = text.trim();
     if (!trimmed || streaming) return;
 
     const s = settingsRef.current;
     const conversation: ChatMessage[] = [...messagesRef.current, { role: 'user', content: trimmed }];
+    shouldAutoScrollRef.current = true;
     setMessages([...conversation, { role: 'assistant', content: '' }]);
     setInput('');
 
     const controller = new AbortController();
     abortRef.current = controller;
     setStreaming(true);
+    let streamIterator: AsyncIterator<string> | null = null;
 
     try {
       if (!webgpuAvailable()) {
         throw new Error('This browser has no WebGPU. Use a recent Chromium browser (Chrome, Edge, or Brave).');
       }
-      const page = await capturePage();
+      setPageNote('Reading page...');
+      const page = await withTimeout(
+        capturePage(),
+        PAGE_CAPTURE_TIMEOUT_MS,
+        'This page took too long to read. LinkedIn pages can be heavy; select the relevant text and try again.',
+      );
+      if (controller.signal.aborted) {
+        setLastAssistant('_(stopped)_');
+        return;
+      }
       if (opts?.selectionOverride && !page.selection.trim()) {
         page.selection = opts.selectionOverride;
       }
-      const built = buildMessages(s, page, conversation, s.webllmCtx);
+      setPageNote('Preparing page context...');
+      const runtimeCtx = contextForSettings(s);
+      const built = buildMessages(s, page, conversation, runtimeCtx);
       const words = Math.max(1, Math.round(built.totalChars / 6));
       if (built.truncated) {
-        const pct = Math.round((built.sentChars / built.totalChars) * 100);
+        const pct = built.totalChars ? Math.round((built.sentChars / built.totalChars) * 100) : 0;
         setPageNote(
-          `⚠ Long page (~${words.toLocaleString()} words): only the first ~${pct}% was sent. Raise the context in ⚙ to read more (uses more memory).`,
+          `⚠ Long/noisy page (~${words.toLocaleString()} words): using a focused ${pct}% slice so the local model stays responsive.`,
         );
+      } else if (built.sourceTruncated) {
+        setPageNote(`⚠ Very large page: read a bounded slice (~${words.toLocaleString()} words) so the extension stays responsive.`);
       } else {
         setPageNote(`Read the full page (~${words.toLocaleString()} words).`);
       }
@@ -199,17 +294,38 @@ export default function App() {
       }
 
       const port = await getWebllmPort();
-      await initModel(port, s.webllmModel, s.webllmCtx, (p) => setLoadProgress(p));
+      await initModel(port, s.webllmModel, runtimeCtx, (p) => setLoadProgress(p));
       setLoadProgress(null);
+      if (controller.signal.aborted) {
+        setLastAssistant('_(stopped)_');
+        return;
+      }
 
-      const stream = streamGenerate(port, ++reqRef.current, built.messages, s.temperature, controller.signal);
+      streamIterator = streamGenerate(port, ++reqRef.current, built.messages, s.temperature, controller.signal)[Symbol.asyncIterator]();
       let acc = '';
-      for await (const delta of stream) {
+      let receivedToken = false;
+      while (true) {
+        const next = await withTimeout(
+          streamIterator.next(),
+          receivedToken ? NEXT_TOKEN_TIMEOUT_MS : FIRST_TOKEN_TIMEOUT_MS,
+          'The local model took too long on this page, so I stopped it. Try selecting the most relevant text or asking a narrower question.',
+          () => controller.abort(),
+        );
+        if (next.done) break;
+        const delta = next.value;
+        receivedToken = true;
         acc += delta;
         setLastAssistant(acc);
       }
-      if (!acc) setLastAssistant('_(no response)_');
+      if (!acc) setLastAssistant(controller.signal.aborted ? '_(stopped)_' : '_(no response)_');
     } catch (e) {
+      if (controller.signal.aborted) {
+        try {
+          await streamIterator?.return?.();
+        } catch {
+          /* stream already closed */
+        }
+      }
       setLastAssistant(`⚠️ ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setStreaming(false);
@@ -239,17 +355,20 @@ export default function App() {
   }
 
   async function onSaveSettings(patch: Partial<Settings>) {
+    const previous = settingsRef.current;
     // Switching model clamps the context to that model's maximum.
     let next = patch;
     if (patch.webllmModel) {
-      const max = webllmModel(patch.webllmModel).maxCtx;
-      const cur = patch.webllmCtx ?? settingsRef.current.webllmCtx;
+      const max = Math.min(webllmModel(patch.webllmModel).maxCtx, MAX_CONTEXT_TOKENS);
+      const cur = patch.webllmCtx ?? previous.webllmCtx;
       if (cur > max) next = { ...patch, webllmCtx: max };
     }
+    const changedKeys = (Object.keys(next) as (keyof Settings)[]).filter((key) => previous[key] !== next[key]);
+    if (!changedKeys.length) return;
     const merged = await saveSettings(next);
     setSettings(merged);
     settingsRef.current = merged;
-    if ('webllmModel' in next || 'webllmCtx' in next) schedulePreload(merged);
+    if (changedKeys.includes('webllmModel') || changedKeys.includes('webllmCtx')) schedulePreload(merged);
   }
 
   const disabled = streaming;
@@ -312,7 +431,7 @@ export default function App() {
       )}
 
       {/* Chat thread */}
-      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-3 py-3">
+      <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-3 py-3" onScroll={onChatScroll}>
         {messages.length === 0 && (
           <div className="mt-6 text-center text-xs text-zinc-400 dark:text-zinc-500">
             Ask anything about the current page. Everything runs locally on your device.
@@ -333,14 +452,14 @@ export default function App() {
               {isUser ? (
                 m.content
               ) : isPlaceholder ? (
-                <span className="text-sm text-zinc-400 dark:text-zinc-500">…</span>
+                <ThinkingIndicator />
               ) : (
                 (() => {
                   const display = stripThink(m.content);
                   return display ? (
                     <Markdown content={display} />
                   ) : (
-                    <span className="text-sm text-zinc-400 dark:text-zinc-500">Thinking…</span>
+                    <ThinkingIndicator />
                   );
                 })()
               )}
@@ -415,7 +534,7 @@ function SettingsPanel({
   busy: boolean;
 }) {
   const inputCls = 'rounded border border-zinc-300 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100';
-  const maxCtx = webllmModel(settings.webllmModel).maxCtx;
+  const maxCtx = Math.min(webllmModel(settings.webllmModel).maxCtx, MAX_CONTEXT_TOKENS);
   return (
     <div className="space-y-3 border-b border-zinc-200 bg-zinc-100 px-3 py-3 text-xs dark:border-zinc-800 dark:bg-zinc-900">
       <label className="block">
@@ -462,15 +581,17 @@ function SettingsPanel({
           type="number"
           className={`mt-1 w-full ${inputCls}`}
           value={settings.webllmCtx}
-          min={2048}
+          min={MIN_CONTEXT_TOKENS}
           max={maxCtx}
-          step={2048}
-          onChange={(e) =>
-            onSave({ webllmCtx: Math.min(maxCtx, Number(e.target.value) || DEFAULT_SETTINGS.webllmCtx) })
-          }
+          step={MIN_CONTEXT_TOKENS}
+          onChange={(e) => {
+            const value = Number(e.target.value);
+            if (!Number.isFinite(value)) return;
+            onSave({ webllmCtx: Math.max(MIN_CONTEXT_TOKENS, Math.min(maxCtx, value || DEFAULT_SETTINGS.webllmCtx)) });
+          }}
         />
         <p className="mt-1 text-[10px] text-zinc-400">
-          Higher reads more of the page but reserves more GPU memory up front. This model supports up to {maxCtx.toLocaleString()}; changing it reloads the model.
+          Higher reads more of the page but reserves more GPU memory up front. Enclave caps this at {maxCtx.toLocaleString()} for stability; changing it reloads the model.
         </p>
       </label>
 
@@ -484,15 +605,6 @@ function SettingsPanel({
           max={1}
           step={0.1}
           onChange={(e) => onSave({ temperature: Number(e.target.value) })}
-        />
-      </label>
-
-      <label className="block">
-        <span className="text-zinc-500 dark:text-zinc-400">System prompt</span>
-        <textarea
-          className={`mt-1 h-20 w-full resize-none ${inputCls}`}
-          value={settings.systemPrompt}
-          onChange={(e) => onSave({ systemPrompt: e.target.value })}
         />
       </label>
 

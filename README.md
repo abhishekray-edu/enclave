@@ -45,7 +45,7 @@ once on first use (cached afterwards), and you can switch anytime.
 | Qwen3 8B | ~5.7 GB | Best, heaviest |
 
 Larger models give better answers but need more GPU memory. The **context window** is
-adjustable in ⚙ (and clamped to each model's maximum).
+adjustable in ⚙ and capped conservatively for stability.
 
 ## Requirements
 
@@ -77,7 +77,7 @@ That's it — no other software to install.
 - **Ask** — type any question about the current page.
 - **Summarize** — one-click page summary.
 - **Explain selection** — select text, then use the button or right-click → *Explain selection with local AI*.
-- **⚙** — switch model, context window, theme, system prompt, temperature, and **Release model from memory**.
+- **⚙** — switch model, context window, theme, temperature, and **Release model from memory**.
 
 ## Architecture
 

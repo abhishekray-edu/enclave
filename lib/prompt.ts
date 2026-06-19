@@ -7,6 +7,7 @@ export function estimateTokens(text: string): number {
 
 /** Reserve this many tokens of the context window for the model's answer. */
 const ANSWER_RESERVE_TOKENS = 1024;
+const MAX_PAGE_CONTEXT_TOKENS = 4096;
 
 /** Head/tail truncation that keeps the start and end of long pages. */
 function truncateToTokens(text: string, maxTokens: number): string {
@@ -38,6 +39,8 @@ export interface BuiltPrompt {
   totalChars: number;
   /** Characters of page text actually sent after truncation. */
   sentChars: number;
+  /** True when page extraction stopped early to stay responsive. */
+  sourceTruncated: boolean;
   /** True when the page did not fit and the middle was dropped. */
   truncated: boolean;
 }
@@ -63,14 +66,14 @@ export function buildMessages(
     conversation.reduce((sum, m) => sum + estimateTokens(m.content) + 8, 0) +
     ANSWER_RESERVE_TOKENS;
 
-  const budgetForPage = ctxTokens - fixedTokens;
+  const budgetForPage = Math.max(0, Math.min(ctxTokens - fixedTokens, MAX_PAGE_CONTEXT_TOKENS));
   const body = truncateToTokens(page.textContent, budgetForPage);
 
   const system: ChatMessage = { role: 'system', content: systemBase + body };
   const totalChars = page.textContent.length;
   // body includes a trim marker when truncated; treat any shrink as truncation.
   const truncated = estimateTokens(page.textContent) > budgetForPage;
-  const sentChars = truncated ? budgetForPage * 4 : totalChars;
+  const sentChars = truncated ? Math.min(totalChars, budgetForPage * 4) : totalChars;
 
-  return { messages: [system, ...conversation], totalChars, sentChars, truncated };
+  return { messages: [system, ...conversation], totalChars, sentChars, sourceTruncated: Boolean(page.sourceTruncated), truncated };
 }

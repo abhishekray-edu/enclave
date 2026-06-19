@@ -44,18 +44,20 @@ export interface LoadProgress {
 
 // ---- Port protocol between the side panel and the offscreen document ----
 export type PanelToOffscreen =
-  | { type: 'init'; model: string; contextWindowSize: number }
+  | { type: 'init'; id: number; model: string; contextWindowSize: number }
   | { type: 'generate'; id: number; messages: ChatMessage[]; temperature: number }
   | { type: 'interrupt' };
 
 export type OffscreenToPanel =
-  | { type: 'progress'; report: LoadProgress }
-  | { type: 'ready' }
+  | { type: 'progress'; id: number; report: LoadProgress }
+  | { type: 'ready'; id: number }
   | { type: 'chunk'; id: number; delta: string }
   | { type: 'done'; id: number }
-  | { type: 'error'; id?: number; message: string };
+  | { type: 'error'; id: number; message: string };
 
 export type WebllmPort = ReturnType<typeof browser.runtime.connect>;
+
+let nextInitId = 0;
 
 /** Ask the background worker to create the offscreen document if needed. */
 export async function ensureOffscreen(): Promise<void> {
@@ -74,9 +76,11 @@ export function initModel(
   contextWindowSize: number,
   onProgress: (p: LoadProgress) => void,
 ): Promise<void> {
+  const id = --nextInitId;
   return new Promise((resolve, reject) => {
     const onMsg = (raw: unknown) => {
       const msg = raw as OffscreenToPanel;
+      if (msg.id !== id) return;
       if (msg.type === 'progress') onProgress(msg.report);
       else if (msg.type === 'ready') {
         cleanup();
@@ -96,7 +100,7 @@ export function initModel(
     }
     port.onMessage.addListener(onMsg);
     port.onDisconnect.addListener(onDisc);
-    port.postMessage({ type: 'init', model, contextWindowSize } satisfies PanelToOffscreen);
+    port.postMessage({ type: 'init', id, model, contextWindowSize } satisfies PanelToOffscreen);
   });
 }
 
@@ -143,6 +147,8 @@ export function streamGenerate(
     } catch {
       /* port already gone */
     }
+    finished = true;
+    wake();
   };
   port.onMessage.addListener(onMsg);
   port.onDisconnect.addListener(onDisc);
