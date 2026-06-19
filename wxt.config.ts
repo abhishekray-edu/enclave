@@ -10,7 +10,7 @@ export default defineConfig({
   manifest: {
     name: 'Enclave',
     description:
-      'A private, on-device AI that reads the page and answers your questions. Runs a local model in your browser — nothing leaves your machine.',
+      'Run LLMs locally in your browser, on your own GPU. Ask about any page — nothing ever leaves your machine.',
     permissions: ['sidePanel', 'contextMenus', 'storage', 'tabs', 'offscreen'],
     // WebLLM runs the model via WebAssembly + WebGPU, which requires 'wasm-unsafe-eval'.
     content_security_policy: {

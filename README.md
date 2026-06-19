@@ -4,11 +4,9 @@
 
 # Enclave
 
-**A private, on-device AI that reads the page you're on — and answers.**
+**Run LLMs locally in your browser, on your own GPU. Nothing ever leaves your machine.**
 
-Ask questions about any web page, summarize it, or explain a selection — powered by a model
-that runs entirely **in your browser** on your GPU. No accounts, no servers, no telemetry.
-Nothing ever leaves your machine.
+Ask about the page you're on, summarize it, or explain a selection — no accounts, no servers, no setup.
 
 </div>
 
@@ -16,22 +14,21 @@ Nothing ever leaves your machine.
 
 ## Why Enclave
 
-Most "AI in your browser" tools send the page you're reading to someone else's cloud. Enclave
-runs the model **on your own hardware, inside the browser** via WebGPU — so your browsing and
-your questions stay private to your machine, with **nothing to install or configure**.
+Enclave runs the model on your own hardware, inside the browser via WebGPU — your browsing and
+your questions stay on your machine, with nothing to install or configure.
 
-It's a Chrome **side-panel** extension: open it next to any tab and chat about what's on screen.
+It's a Chrome **side-panel** extension: open it beside any tab and chat about what's on screen.
 
 ## Features
 
-- 🔒 **Fully local & private** — the model runs in your browser; your data never leaves the device.
-- ⚡ **Zero setup** — no server, no account, no API key. Install the extension and ask.
-- 🧠 **Pick your model by RAM** — six options from a 1B lightweight to an 8B powerhouse.
-- 📄 **Reads the real page** — robust extraction across SPAs, shadow DOM, and same-origin iframes.
-- 💬 **Quick actions** — Ask about the page, Summarize, or Explain a selection (also via right-click).
-- ✨ **Clean answers** — Markdown with syntax-highlighted, copyable code blocks.
-- 🌓 **Polished UI** — neutral light/dark theme that follows your system.
-- 🔥 **Stays warm** — the model is kept resident in the background, so follow-up questions are instant.
+- **Fully local & private** — the model runs in your browser; your data never leaves the device.
+- **Zero setup** — no server, no account, no API key. Install the extension and ask.
+- **Pick your model by RAM** — six options from a 1B lightweight to an 8B powerhouse.
+- **Reads the real page** — robust extraction across SPAs, shadow DOM, and same-origin iframes.
+- **Quick actions** — Ask about the page, Summarize, or Explain a selection (also via right-click).
+- **Clean answers** — Markdown with syntax-highlighted, copyable code blocks.
+- **Polished UI** — neutral light/dark theme that follows your system.
+- **Stays warm** — the model is kept resident in the background, so follow-up questions are instant.
 
 ## Models
 
