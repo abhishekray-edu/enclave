@@ -52,9 +52,8 @@ export function buildMessages(
   settings: Settings,
   page: PageContent,
   conversation: ChatMessage[],
-  /** Context window in tokens; defaults to the Ollama setting. Pass a smaller
-   *  value for the in-browser engine, which runs a tighter window. */
-  ctxTokens: number = settings.numCtx,
+  /** Context window in tokens to budget the page text against. */
+  ctxTokens: number,
 ): BuiltPrompt {
   const header = pageHeader(page);
   const systemBase = `${settings.systemPrompt}\n\n--- PAGE CONTEXT ---\n${header}\n\n--- PAGE CONTENT ---\n`;

@@ -1,6 +1,6 @@
 {
   "name": "enclave",
-  "description": "A private, on-device AI that reads the page and answers — local model via in-browser WebGPU or Ollama. Nothing leaves your machine.",
+  "description": "Run LLMs locally in your browser, on your own GPU — a private page assistant. Nothing ever leaves your machine.",
   "license": "MIT",
   "homepage": "https://github.com/abhishekray-edu/enclave",
   "repository": {

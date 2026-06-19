@@ -3,14 +3,32 @@
 import { browser } from 'wxt/browser';
 import type { ChatMessage } from './types';
 
-/** Curated in-browser models (ids verified against WebLLM's prebuilt catalog). */
-export const WEBLLM_MODELS: Array<{ id: string; label: string }> = [
-  { id: 'Qwen3-4B-q4f16_1-MLC', label: 'Qwen3 4B — recommended' },
-  { id: 'gemma-2-2b-it-q4f16_1-MLC', label: 'Gemma 2 2B — lightest' },
-  { id: 'Qwen2.5-3B-Instruct-q4f16_1-MLC', label: 'Qwen2.5 3B' },
-  { id: 'Llama-3.1-8B-Instruct-q4f16_1-MLC', label: 'Llama 3.1 8B — best, heavier' },
-  { id: 'Phi-3.5-mini-instruct-q4f16_1-MLC', label: 'Phi-3.5 mini' },
+export interface WebllmModelOption {
+  id: string;
+  label: string;
+  /** Approximate memory footprint at base context, in GB (for the RAM-tiered menu). */
+  approxGb: number;
+  /** Max context (tokens) the build supports, capped for memory sanity. */
+  maxCtx: number;
+  /** Short tier note shown in the picker. */
+  note: string;
+}
+
+/** RAM-tiered in-browser models — ids, memory, and per-model context caps verified
+ *  against WebLLM's prebuilt catalog and each model's mlc-chat-config. */
+export const WEBLLM_MODELS: WebllmModelOption[] = [
+  { id: 'Llama-3.2-1B-Instruct-q4f16_1-MLC', label: 'Llama 3.2 1B', approxGb: 1.0, maxCtx: 40960, note: 'Lightest & fastest' },
+  { id: 'gemma-2-2b-it-q4f16_1-MLC', label: 'Gemma 2 2B', approxGb: 1.9, maxCtx: 4096, note: 'Light' },
+  { id: 'Llama-3.2-3B-Instruct-q4f16_1-MLC', label: 'Llama 3.2 3B', approxGb: 2.3, maxCtx: 40960, note: 'Balanced' },
+  { id: 'Qwen3-4B-q4f16_1-MLC', label: 'Qwen3 4B', approxGb: 3.4, maxCtx: 40960, note: 'Recommended' },
+  { id: 'Llama-3.1-8B-Instruct-q4f16_1-MLC', label: 'Llama 3.1 8B', approxGb: 5.0, maxCtx: 40960, note: 'High quality' },
+  { id: 'Qwen3-8B-q4f16_1-MLC', label: 'Qwen3 8B', approxGb: 5.7, maxCtx: 40960, note: 'Best, heaviest' },
 ];
+
+/** Look up a model option by id (falls back to the default model). */
+export function webllmModel(id: string): WebllmModelOption {
+  return WEBLLM_MODELS.find((m) => m.id === id) ?? WEBLLM_MODELS[3];
+}
 
 export const PORT_NAME = 'webllm';
 
