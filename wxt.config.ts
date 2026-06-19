@@ -11,7 +11,7 @@ export default defineConfig({
     name: 'Enclave',
     description:
       'Run LLMs locally in your browser, on your own GPU. Ask about any page — nothing ever leaves your machine.',
-    permissions: ['sidePanel', 'contextMenus', 'storage', 'tabs', 'offscreen'],
+    permissions: ['sidePanel', 'contextMenus', 'storage', 'tabs', 'offscreen', 'scripting', 'activeTab'],
     // WebLLM runs the model via WebAssembly + WebGPU, which requires 'wasm-unsafe-eval'.
     content_security_policy: {
       extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
