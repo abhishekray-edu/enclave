@@ -1,0 +1,158 @@
+@import 'tailwindcss';
+
+/* Class-based dark mode: `dark:` utilities apply when <html> has the `dark` class. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+  background: #f4f4f5;
+}
+.dark body {
+  background: #18181b;
+}
+
+/* ---- Markdown rendering for assistant messages ---- */
+.markdown {
+  font-size: 0.875rem;
+  line-height: 1.55;
+  word-break: break-word;
+}
+.markdown > :first-child {
+  margin-top: 0;
+}
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+.markdown p {
+  margin: 0.5rem 0;
+}
+.markdown ul,
+.markdown ol {
+  margin: 0.5rem 0;
+  padding-left: 1.25rem;
+}
+.markdown ul {
+  list-style: disc;
+}
+.markdown ol {
+  list-style: decimal;
+}
+.markdown li {
+  margin: 0.15rem 0;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  font-weight: 600;
+  line-height: 1.3;
+  margin: 0.7rem 0 0.35rem;
+}
+.markdown h1 {
+  font-size: 1.15rem;
+}
+.markdown h2 {
+  font-size: 1.05rem;
+}
+.markdown h3 {
+  font-size: 0.95rem;
+}
+.markdown a {
+  color: #2563eb;
+  text-decoration: underline;
+}
+.markdown blockquote {
+  border-left: 3px solid #d4d4d8;
+  margin: 0.5rem 0;
+  padding-left: 0.75rem;
+  color: #52525b;
+}
+.markdown table {
+  border-collapse: collapse;
+  margin: 0.5rem 0;
+  font-size: 0.8rem;
+  display: block;
+  overflow-x: auto;
+}
+.markdown th,
+.markdown td {
+  border: 1px solid #d4d4d8;
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+}
+.markdown th {
+  background: #f4f4f5;
+}
+
+.inline-code {
+  background: #e4e4e7;
+  border-radius: 4px;
+  padding: 0.05rem 0.3rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82em;
+}
+
+.code-block {
+  margin: 0.5rem 0;
+  border-radius: 10px;
+  overflow: hidden;
+  background: #282c34;
+  border: 1px solid #1b1e24;
+}
+.code-block__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.35rem 0.45rem 0.35rem 0.85rem;
+  background: #21252b;
+  border-bottom: 1px solid #1b1e24;
+}
+.code-block__lang {
+  color: #c8cdd6;
+  font-size: 0.8rem;
+  font-weight: 500;
+}
+.code-block__body {
+  margin: 0;
+  padding: 0.7rem 0.85rem;
+  overflow-x: auto;
+}
+.code-block__body code.hljs {
+  padding: 0;
+  background: transparent;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  white-space: pre;
+}
+
+/* ---- Dark-mode overrides for markdown (code blocks already use a dark theme) ---- */
+.dark .markdown a {
+  color: #60a5fa;
+}
+.dark .inline-code {
+  background: #3f3f46;
+  color: #e4e4e7;
+}
+.dark .markdown blockquote {
+  border-color: #3f3f46;
+  color: #a1a1aa;
+}
+.dark .markdown th,
+.dark .markdown td {
+  border-color: #3f3f46;
+}
+.dark .markdown th {
+  background: #27272a;
+}

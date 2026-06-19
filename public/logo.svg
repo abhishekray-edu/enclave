@@ -1,0 +1,21 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="enclaveHex" x1="20" y1="8" x2="108" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3f3f46"/>
+      <stop offset="1" stop-color="#1c1c1f"/>
+    </linearGradient>
+    <linearGradient id="enclaveSpark" x1="40" y1="36" x2="88" y2="92" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d4d4d8"/>
+    </linearGradient>
+  </defs>
+  <!-- Hexagon: chip / secure enclave -->
+  <polygon points="64,8 114,36 114,92 64,120 14,92 14,36"
+           fill="url(#enclaveHex)" stroke="#52525b" stroke-width="5" stroke-linejoin="round"/>
+  <!-- Inner enclosure line reinforces "enclave" -->
+  <polygon points="64,24 100,44 100,84 64,104 28,84 28,44"
+           fill="none" stroke="#ffffff" stroke-opacity="0.10" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- AI spark -->
+  <path d="M64 36 C65.5 50 78 62.5 92 64 C78 65.5 65.5 78 64 92 C62.5 78 50 65.5 36 64 C50 62.5 62.5 50 64 36 Z"
+        fill="url(#enclaveSpark)"/>
+</svg>
