@@ -1,8 +1,14 @@
 {
-  "name": "wxt-react-starter",
-  "description": "manifest.json description",
+  "name": "enclave",
+  "description": "A private, on-device AI that reads the page and answers — local model via in-browser WebGPU or Ollama. Nothing leaves your machine.",
+  "license": "MIT",
+  "homepage": "https://github.com/abhishekray-edu/enclave",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/abhishekray-edu/enclave.git"
+  },
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "wxt",
@@ -16,6 +22,7 @@
     "postinstall": "wxt prepare"
   },
   "dependencies": {
+    "@mlc-ai/web-llm": "^0.2.84",
     "@mozilla/readability": "^0.6.0",
     "dompurify": "^3.4.11",
     "highlight.js": "^11.11.1",
