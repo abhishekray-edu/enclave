@@ -20,16 +20,15 @@ highlight.js for rendering.
 
 **Model choice.** A small RAM-tiered menu (Llama 3.2 1B → Qwen3 8B, default Qwen3 4B) lets the
 user pick a model that fits their machine; each downloads once and is cached. The context
-window is clamped per model to its build's maximum.
+window is clamped per model and capped conservatively for stability.
 
 **In-browser inference (WebGPU via WebLLM).** The selected model (default **Qwen3 4B**, 4-bit)
 runs in the browser with GPU acceleration. On first use its weights download once (~1–6 GB
 depending on the model) into the browser cache and are reused afterwards. Inference runs at
-~80% of native speed on Apple Silicon. The context window is configurable, defaults to the
-model build's maximum, and is clamped per model (e.g. Gemma 2 = 4096, Qwen3 = 40960). The KV
-cache is pre-allocated for the configured window at load time, so it reserves GPU memory up
-front regardless of how much is used; lower it on memory-constrained machines. WebGPU and a
-CSP allowing `wasm-unsafe-eval` (for the WebAssembly runtime) are required.
+~80% of native speed on Apple Silicon. The context window is configurable but defaults to a
+conservative 8192-token cap because the KV cache is pre-allocated for the configured window at
+load time, so very large windows can reserve enough GPU memory to stall lower-resource machines.
+WebGPU and a CSP allowing `wasm-unsafe-eval` (for the WebAssembly runtime) are required.
 
 **The model lives in an offscreen document — the key piece.** The side panel is recreated each
 time it opens, so the WebLLM engine runs in a persistent **offscreen document** that stays

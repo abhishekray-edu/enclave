@@ -22,6 +22,109 @@ body {
   background: #18181b;
 }
 
+/* ---- Streaming placeholder ---- */
+.thinking-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 1.35rem;
+  color: #71717a;
+  font-size: 0.875rem;
+  line-height: 1.35;
+}
+
+.thinking-indicator__spinner {
+  width: 0.85rem;
+  height: 0.85rem;
+  border-radius: 999px;
+  background:
+    radial-gradient(circle at center, #ffffff 0 38%, transparent 40%),
+    conic-gradient(from 0deg, #18181b, #a1a1aa 45%, #e4e4e7 62%, #18181b);
+  animation: thinking-spin 1s linear infinite;
+  flex: 0 0 auto;
+}
+
+.thinking-indicator__label {
+  white-space: nowrap;
+}
+
+.thinking-indicator__dots::after {
+  content: '';
+  animation: thinking-dots 1.25s steps(4, end) infinite;
+}
+
+.thinking-indicator__wave {
+  display: inline-flex;
+  align-items: end;
+  gap: 0.12rem;
+  height: 0.7rem;
+  margin-left: 0.1rem;
+}
+
+.thinking-indicator__wave span {
+  width: 0.16rem;
+  height: 0.25rem;
+  border-radius: 999px;
+  background: #a1a1aa;
+  animation: thinking-wave 0.9s ease-in-out infinite;
+}
+
+.thinking-indicator__wave span:nth-child(2) {
+  animation-delay: 0.12s;
+}
+
+.thinking-indicator__wave span:nth-child(3) {
+  animation-delay: 0.24s;
+}
+
+.dark .thinking-indicator {
+  color: #a1a1aa;
+}
+
+.dark .thinking-indicator__spinner {
+  background:
+    radial-gradient(circle at center, #27272a 0 38%, transparent 40%),
+    conic-gradient(from 0deg, #fafafa, #71717a 45%, #3f3f46 62%, #fafafa);
+}
+
+.dark .thinking-indicator__wave span {
+  background: #71717a;
+}
+
+@keyframes thinking-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes thinking-dots {
+  0% {
+    content: '';
+  }
+  25% {
+    content: '.';
+  }
+  50% {
+    content: '..';
+  }
+  75%,
+  100% {
+    content: '...';
+  }
+}
+
+@keyframes thinking-wave {
+  0%,
+  100% {
+    transform: scaleY(0.7);
+    opacity: 0.55;
+  }
+  45% {
+    transform: scaleY(1.9);
+    opacity: 1;
+  }
+}
+
 /* ---- Markdown rendering for assistant messages ---- */
 .markdown {
   font-size: 0.875rem;

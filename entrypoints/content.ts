@@ -7,11 +7,36 @@ const BLOCK_TAGS = new Set([
   'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI', 'UL', 'OL', 'TR', 'TABLE',
   'PRE', 'BLOCKQUOTE', 'BR', 'HR', 'FORM', 'LABEL', 'TEXTAREA',
 ]);
+const MAX_EXTRACTED_CHARS = 60_000;
+
+interface TextBudget {
+  chars: number;
+  truncated: boolean;
+}
 
 function isHidden(el: Element): boolean {
   if (el.hasAttribute('hidden') || el.getAttribute('aria-hidden') === 'true') return true;
   const s = getComputedStyle(el);
   return s.display === 'none' || s.visibility === 'hidden';
+}
+
+function pushText(out: string[], budget: TextBudget, text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ');
+  if (!normalized.trim()) return true;
+  const remaining = MAX_EXTRACTED_CHARS - budget.chars;
+  if (remaining <= 0) {
+    budget.truncated = true;
+    return false;
+  }
+  if (normalized.length > remaining) {
+    out.push(normalized.slice(0, remaining));
+    budget.chars += remaining;
+    budget.truncated = true;
+    return false;
+  }
+  out.push(normalized);
+  budget.chars += normalized.length;
+  return true;
 }
 
 /**
@@ -20,12 +45,12 @@ function isHidden(el: Element): boolean {
  * Used for app-like pages (SPAs, dashboards, coding sites) where article
  * extraction loses the real content.
  */
-function deepText(root: Node, out: string[], depth = 0) {
-  if (depth > 50) return;
+function deepText(root: Node, out: string[], budget: TextBudget, depth = 0) {
+  if (budget.truncated || depth > 50) return;
 
   if (root.nodeType === Node.TEXT_NODE) {
     const t = root.textContent;
-    if (t && t.trim()) out.push(t.replace(/\s+/g, ' '));
+    if (t) pushText(out, budget, t);
     return;
   }
   if (root.nodeType !== Node.ELEMENT_NODE) return;
@@ -36,39 +61,47 @@ function deepText(root: Node, out: string[], depth = 0) {
   // Form field values aren't in the text tree — capture them explicitly.
   if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
     const v = (el as HTMLInputElement | HTMLTextAreaElement).value;
-    if (v && v.trim()) out.push(v.trim());
+    if (v && !pushText(out, budget, v.trim())) return;
   }
 
   // Descend into shadow DOM (web components).
   const shadow = (el as Element & { shadowRoot?: ShadowRoot | null }).shadowRoot;
   if (shadow) {
-    shadow.childNodes.forEach((c) => deepText(c, out, depth + 1));
+    for (const c of shadow.childNodes) {
+      if (budget.truncated) return;
+      deepText(c, out, budget, depth + 1);
+    }
   }
 
   // Descend into same-origin iframes (cross-origin throws and is skipped).
   if (el.tagName === 'IFRAME') {
     try {
       const doc = (el as HTMLIFrameElement).contentDocument;
-      if (doc?.body) deepText(doc.body, out, depth + 1);
+      if (doc?.body) deepText(doc.body, out, budget, depth + 1);
     } catch {
       /* cross-origin frame — not readable from here */
     }
     return;
   }
 
-  el.childNodes.forEach((c) => deepText(c, out, depth + 1));
-  if (BLOCK_TAGS.has(el.tagName)) out.push('\n');
+  for (const c of el.childNodes) {
+    if (budget.truncated) return;
+    deepText(c, out, budget, depth + 1);
+  }
+  if (!budget.truncated && BLOCK_TAGS.has(el.tagName)) out.push('\n');
 }
 
-function collectDeepText(): string {
+function collectDeepText(): { text: string; truncated: boolean } {
   const out: string[] = [];
-  if (document.body) deepText(document.body, out);
-  return out
+  const budget = { chars: 0, truncated: false };
+  if (document.body) deepText(document.body, out, budget);
+  const text = out
     .join(' ')
     .replace(/[ \t]+/g, ' ')
     .replace(/ ?\n ?/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+  return { text, truncated: budget.truncated };
 }
 
 function extractPage(): PageContent {
@@ -100,8 +133,8 @@ function extractPage(): PageContent {
     /* fall back to deep text */
   }
 
-  const useArticle = articleText.length > 500 && articleText.length >= deep.length * 0.5;
-  const textContent = useArticle ? articleText : deep || articleText;
+  const useArticle = articleText.length > 500 && articleText.length >= deep.text.length * 0.5;
+  const textContent = useArticle ? articleText : deep.text || articleText;
 
   return {
     title,
@@ -111,6 +144,7 @@ function extractPage(): PageContent {
     byline,
     siteName,
     selection,
+    sourceTruncated: useArticle ? false : deep.truncated,
   };
 }
 
