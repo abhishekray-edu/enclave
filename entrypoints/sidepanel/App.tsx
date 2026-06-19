@@ -21,16 +21,31 @@ import { DEFAULT_SETTINGS, type ChatMessage, type PageContent, type PendingActio
 
 const PENDING_KEY = 'pendingAction';
 
-/** Capture the active tab's content via the content script. */
+// chrome.scripting isn't in the polyfill types; access the global directly.
+const scripting = (globalThis as unknown as {
+  chrome: { scripting: { executeScript(opts: { target: { tabId: number }; files: string[] }): Promise<unknown> } };
+}).chrome.scripting;
+
+/** Capture the active tab's content. If the content script isn't present (e.g. the tab was
+ *  open before the extension was installed/updated), inject it on demand and retry. */
 async function capturePage(): Promise<PageContent> {
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) throw new Error('No active tab.');
+  const tabId = tab.id;
+  const ask = () => browser.tabs.sendMessage(tabId, { type: 'GET_PAGE_CONTENT' }) as Promise<PageContent>;
+
   try {
-    return (await browser.tabs.sendMessage(tab.id, { type: 'GET_PAGE_CONTENT' })) as PageContent;
+    return await ask();
   } catch {
-    throw new Error(
-      "Can't read this page. Try reloading the tab — restricted pages (chrome://, the Web Store, PDFs) can't be read.",
-    );
+    // Content script not loaded in this tab — inject it, then retry once.
+    try {
+      await scripting.executeScript({ target: { tabId }, files: ['content-scripts/content.js'] });
+      return await ask();
+    } catch {
+      throw new Error(
+        "Can't read this page. Restricted pages (chrome://, the Chrome Web Store, PDFs, and local files) can't be read.",
+      );
+    }
   }
 }
 
