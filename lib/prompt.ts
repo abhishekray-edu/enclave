@@ -52,6 +52,9 @@ export function buildMessages(
   settings: Settings,
   page: PageContent,
   conversation: ChatMessage[],
+  /** Context window in tokens; defaults to the Ollama setting. Pass a smaller
+   *  value for the in-browser engine, which runs a tighter window. */
+  ctxTokens: number = settings.numCtx,
 ): BuiltPrompt {
   const header = pageHeader(page);
   const systemBase = `${settings.systemPrompt}\n\n--- PAGE CONTEXT ---\n${header}\n\n--- PAGE CONTENT ---\n`;
@@ -61,7 +64,7 @@ export function buildMessages(
     conversation.reduce((sum, m) => sum + estimateTokens(m.content) + 8, 0) +
     ANSWER_RESERVE_TOKENS;
 
-  const budgetForPage = settings.numCtx - fixedTokens;
+  const budgetForPage = ctxTokens - fixedTokens;
   const body = truncateToTokens(page.textContent, budgetForPage);
 
   const system: ChatMessage = { role: 'system', content: systemBase + body };

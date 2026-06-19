@@ -2,11 +2,21 @@ import { useEffect, useRef, useState } from 'react';
 import { browser } from 'wxt/browser';
 import { loadSettings, saveSettings } from '@/lib/settings';
 import { chatStream, listModels, OllamaConnectionError } from '@/lib/ollama';
+import {
+  WEBLLM_MODELS,
+  PORT_NAME,
+  webgpuAvailable,
+  ensureOffscreen,
+  releaseOffscreen,
+  initModel,
+  streamGenerate,
+  type WebllmPort,
+} from '@/lib/webllmClient';
 import { buildMessages } from '@/lib/prompt';
 import { Markdown } from './Markdown';
 import { Logo } from './Logo';
 import { applyTheme } from '@/lib/theme';
-import { DEFAULT_SETTINGS, type ChatMessage, type PageContent, type PendingAction, type Settings, type Theme } from '@/lib/types';
+import { DEFAULT_SETTINGS, type ChatMessage, type Engine, type PageContent, type PendingAction, type Settings, type Theme } from '@/lib/types';
 
 const PENDING_KEY = 'pendingAction';
 
@@ -23,6 +33,15 @@ async function capturePage(): Promise<PageContent> {
   }
 }
 
+/** Remove Qwen-style <think>…</think> reasoning from displayed output.
+ *  While a block is still open mid-stream, hide everything from it onward. */
+function stripThink(text: string): string {
+  let out = text.replace(/<think>[\s\S]*?<\/think>/gi, '');
+  const open = out.lastIndexOf('<think>');
+  if (open !== -1 && !/<\/think>/i.test(out.slice(open))) out = out.slice(0, open);
+  return out.replace(/^\s+/, '');
+}
+
 export default function App() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [models, setModels] = useState<string[]>([]);
@@ -32,6 +51,12 @@ export default function App() {
   const [streaming, setStreaming] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [pageNote, setPageNote] = useState<string | null>(null);
+  const [loadProgress, setLoadProgress] = useState<{ text: string; progress: number } | null>(null);
+
+  // Long-lived port to the offscreen document that hosts the in-browser engine.
+  const portRef = useRef<WebllmPort | null>(null);
+  const reqRef = useRef(0);
+  const preloadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Refs keep submit() free of stale closures (settings load async; pending action auto-runs).
   const settingsRef = useRef(settings);
@@ -47,7 +72,7 @@ export default function App() {
       const s = await loadSettings();
       setSettings(s);
       settingsRef.current = s;
-      await refreshModels(s.endpoint);
+      if (s.engine === 'ollama') await refreshModels(s.endpoint);
 
       const stored = await browser.storage.local.get(PENDING_KEY);
       const pending = stored[PENDING_KEY] as PendingAction | undefined;
@@ -81,6 +106,45 @@ export default function App() {
     }
   }
 
+  /** Ensure the offscreen document exists and we hold a live port to it. */
+  async function getWebllmPort(): Promise<WebllmPort> {
+    if (portRef.current) return portRef.current;
+    await ensureOffscreen();
+    const port = browser.runtime.connect({ name: PORT_NAME });
+    port.onDisconnect.addListener(() => {
+      if (portRef.current === port) portRef.current = null;
+    });
+    portRef.current = port;
+    return port;
+  }
+
+  /** Free the in-browser model from memory by closing the offscreen document. */
+  async function releaseModel() {
+    portRef.current?.disconnect();
+    portRef.current = null;
+    await releaseOffscreen();
+    setPageNote('In-browser model released — it will reload on your next question.');
+  }
+
+  /** Proactively (re)load the in-browser model so it's ready before the next message. */
+  async function preloadWebllm(s: Settings) {
+    if (s.engine !== 'webllm' || !webgpuAvailable() || abortRef.current) return;
+    try {
+      const port = await getWebllmPort();
+      await initModel(port, s.webllmModel, s.webllmCtx, (p) => setLoadProgress(p));
+    } catch {
+      /* a real error surfaces on the next send */
+    } finally {
+      setLoadProgress(null);
+    }
+  }
+
+  /** Debounce reloads so editing the context number doesn't reload on every keystroke. */
+  function schedulePreload(s: Settings) {
+    if (preloadTimerRef.current) clearTimeout(preloadTimerRef.current);
+    preloadTimerRef.current = setTimeout(() => void preloadWebllm(s), 700);
+  }
+
   function setLastAssistant(content: string) {
     setMessages((prev) => {
       const copy = [...prev];
@@ -107,19 +171,46 @@ export default function App() {
       if (opts?.selectionOverride && !page.selection.trim()) {
         page.selection = opts.selectionOverride;
       }
-      const built = buildMessages(s, page, conversation);
+      const isWebllm = s.engine === 'webllm';
+      const ctxTokens = isWebllm ? s.webllmCtx : s.numCtx;
+      const built = buildMessages(s, page, conversation, ctxTokens);
       const words = Math.max(1, Math.round(built.totalChars / 6));
       if (built.truncated) {
         const pct = Math.round((built.sentChars / built.totalChars) * 100);
-        setPageNote(
-          `⚠ Long page (~${words.toLocaleString()} words): only the first ~${pct}% was sent. Raise context in ⚙ for fuller coverage (slower).`,
-        );
+        const hint = isWebllm ? 'In-browser models use a small window.' : 'Raise context in ⚙ for fuller coverage (slower).';
+        setPageNote(`⚠ Long page (~${words.toLocaleString()} words): only the first ~${pct}% was sent. ${hint}`);
       } else {
         setPageNote(`Read the full page (~${words.toLocaleString()} words).`);
       }
 
+      // Qwen3 is a hybrid reasoning model that emits <think> blocks by default.
+      // Its soft switch is read from the user turn, so disable thinking there.
+      // Replace the slot with a COPY so the displayed message isn't altered.
+      if (isWebllm && /Qwen3/i.test(s.webllmModel)) {
+        const i = built.messages.length - 1;
+        const last = built.messages[i];
+        if (last.role === 'user') {
+          built.messages[i] = { ...last, content: `${last.content} /no_think` };
+        }
+      }
+
+      let stream: AsyncGenerator<string, void, unknown>;
+      if (isWebllm) {
+        if (!webgpuAvailable()) {
+          throw new Error(
+            'This browser has no WebGPU, so the in-browser engine can’t run. Use a recent Chromium browser, or switch to Ollama in ⚙.',
+          );
+        }
+        const port = await getWebllmPort();
+        await initModel(port, s.webllmModel, s.webllmCtx, (p) => setLoadProgress(p));
+        setLoadProgress(null);
+        stream = streamGenerate(port, ++reqRef.current, built.messages, s.temperature, controller.signal);
+      } else {
+        stream = chatStream({ settings: s, messages: built.messages, signal: controller.signal });
+      }
+
       let acc = '';
-      for await (const delta of chatStream({ settings: s, messages: built.messages, signal: controller.signal })) {
+      for await (const delta of stream) {
         acc += delta;
         setLastAssistant(acc);
       }
@@ -130,6 +221,7 @@ export default function App() {
       if (e instanceof OllamaConnectionError) setConnectionError(msg);
     } finally {
       setStreaming(false);
+      setLoadProgress(null);
       abortRef.current = null;
     }
   }
@@ -159,6 +251,11 @@ export default function App() {
     const next = await saveSettings(patch);
     setSettings(next);
     settingsRef.current = next;
+    if (patch.engine === 'ollama') void refreshModels(next.endpoint);
+    // A model-affecting change should reload the in-browser engine now, not on next send.
+    if (next.engine === 'webllm' && ('engine' in patch || 'webllmModel' in patch || 'webllmCtx' in patch)) {
+      schedulePreload(next);
+    }
   }
 
   const disabled = streaming;
@@ -169,19 +266,34 @@ export default function App() {
       <header className="flex items-center gap-2 border-b border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-zinc-900">
         <Logo size={18} />
         <span className="text-sm font-semibold tracking-tight">Enclave</span>
-        <select
-          className="ml-auto max-w-[10rem] truncate rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
-          value={settings.model}
-          onChange={(e) => onSaveSettings({ model: e.target.value })}
-          title="Model"
-        >
-          {!models.includes(settings.model) && <option value={settings.model}>{settings.model}</option>}
-          {models.map((m) => (
-            <option key={m} value={m}>
-              {m}
-            </option>
-          ))}
-        </select>
+        {settings.engine === 'webllm' ? (
+          <select
+            className="ml-auto max-w-[11rem] truncate rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
+            value={settings.webllmModel}
+            onChange={(e) => onSaveSettings({ webllmModel: e.target.value })}
+            title="In-browser model"
+          >
+            {WEBLLM_MODELS.map((m) => (
+              <option key={m.id} value={m.id}>
+                {m.label}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <select
+            className="ml-auto max-w-[11rem] truncate rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
+            value={settings.model}
+            onChange={(e) => onSaveSettings({ model: e.target.value })}
+            title="Ollama model"
+          >
+            {!models.includes(settings.model) && <option value={settings.model}>{settings.model}</option>}
+            {models.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        )}
         <button
           className="rounded px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
           onClick={() => setShowSettings((v) => !v)}
@@ -191,8 +303,24 @@ export default function App() {
         </button>
       </header>
 
-      {/* Connection / CORS banner */}
-      {connectionError && (
+      {/* In-browser model download / load progress */}
+      {loadProgress && (
+        <div className="border-b border-zinc-200 bg-zinc-100 px-3 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900">
+          <p className="text-zinc-600 dark:text-zinc-300">
+            Loading in-browser model… {Math.round(loadProgress.progress * 100)}%
+          </p>
+          <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-zinc-300 dark:bg-zinc-700">
+            <div
+              className="h-full bg-zinc-600 transition-all dark:bg-zinc-300"
+              style={{ width: `${Math.round(loadProgress.progress * 100)}%` }}
+            />
+          </div>
+          <p className="mt-1 truncate text-[10px] text-zinc-400">{loadProgress.text}</p>
+        </div>
+      )}
+
+      {/* Connection / CORS banner (Ollama engine only) */}
+      {connectionError && settings.engine === 'ollama' && (
         <div className="border-b border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-800/60 dark:bg-amber-950/40 dark:text-amber-200">
           <p className="font-medium">Can’t reach Ollama.</p>
           <p className="mt-1">{connectionError}</p>
@@ -217,6 +345,8 @@ export default function App() {
           settings={settings}
           onSave={onSaveSettings}
           onRefreshModels={() => refreshModels(settings.endpoint)}
+          onRelease={releaseModel}
+          busy={streaming}
         />
       )}
 
@@ -257,7 +387,14 @@ export default function App() {
               ) : isPlaceholder ? (
                 <span className="text-sm text-zinc-400 dark:text-zinc-500">…</span>
               ) : (
-                <Markdown content={m.content} />
+                (() => {
+                  const display = stripThink(m.content);
+                  return display ? (
+                    <Markdown content={display} />
+                  ) : (
+                    <span className="text-sm text-zinc-400 dark:text-zinc-500">Thinking…</span>
+                  );
+                })()
               )}
             </div>
           );
@@ -322,10 +459,14 @@ function SettingsPanel({
   settings,
   onSave,
   onRefreshModels,
+  onRelease,
+  busy,
 }: {
   settings: Settings;
   onSave: (patch: Partial<Settings>) => void;
   onRefreshModels: () => void;
+  onRelease: () => void;
+  busy: boolean;
 }) {
   const inputCls =
     'rounded border border-zinc-300 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100';
@@ -350,47 +491,104 @@ function SettingsPanel({
           ))}
         </div>
       </label>
+
       <label className="block">
-        <span className="text-zinc-500 dark:text-zinc-400">Ollama endpoint</span>
-        <div className="mt-1 flex gap-2">
-          <input
-            className={`flex-1 ${inputCls}`}
-            value={settings.endpoint}
-            onChange={(e) => onSave({ endpoint: e.target.value })}
-          />
-          <button
-            className="rounded border border-zinc-300 bg-white px-2 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
-            onClick={onRefreshModels}
-          >
-            Refresh
-          </button>
+        <span className="text-zinc-500 dark:text-zinc-400">Engine</span>
+        <div className="mt-1 inline-flex overflow-hidden rounded border border-zinc-300 dark:border-zinc-700">
+          {([['webllm', 'In-browser'], ['ollama', 'Ollama']] as [Engine, string][]).map(([e, label]) => (
+            <button
+              key={e}
+              className={
+                'px-2.5 py-1 ' +
+                (settings.engine === e
+                  ? 'bg-zinc-800 text-white dark:bg-zinc-600'
+                  : 'bg-white hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-700')
+              }
+              onClick={() => onSave({ engine: e })}
+            >
+              {label}
+            </button>
+          ))}
         </div>
+        <p className="mt-1 text-[10px] text-zinc-400">
+          {settings.engine === 'webllm'
+            ? 'Runs on your GPU in the browser — no setup. First use downloads the model (~2.5GB, cached after). Stays loaded in the background so it’s instant next time.'
+            : 'Uses your local Ollama server — fastest and supports bigger models; needs Ollama running.'}
+        </p>
+        {settings.engine === 'webllm' && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onRelease}
+            className="mt-2 rounded border border-zinc-300 bg-white px-2 py-1 hover:bg-zinc-50 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
+          >
+            Release model from memory
+          </button>
+        )}
       </label>
-      <div className="flex gap-2">
-        <label className="flex-1">
-          <span className="text-zinc-500 dark:text-zinc-400">Context (num_ctx)</span>
+
+      {settings.engine === 'ollama' && (
+        <>
+          <label className="block">
+            <span className="text-zinc-500 dark:text-zinc-400">Ollama endpoint</span>
+            <div className="mt-1 flex gap-2">
+              <input
+                className={`flex-1 ${inputCls}`}
+                value={settings.endpoint}
+                onChange={(e) => onSave({ endpoint: e.target.value })}
+              />
+              <button
+                className="rounded border border-zinc-300 bg-white px-2 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
+                onClick={onRefreshModels}
+              >
+                Refresh
+              </button>
+            </div>
+          </label>
+          <label className="block">
+            <span className="text-zinc-500 dark:text-zinc-400">Context (num_ctx)</span>
+            <input
+              type="number"
+              className={`mt-1 w-full ${inputCls}`}
+              value={settings.numCtx}
+              min={2048}
+              step={2048}
+              onChange={(e) => onSave({ numCtx: Number(e.target.value) || DEFAULT_SETTINGS.numCtx })}
+            />
+          </label>
+        </>
+      )}
+
+      {settings.engine === 'webllm' && (
+        <label className="block">
+          <span className="text-zinc-500 dark:text-zinc-400">Context (tokens)</span>
           <input
             type="number"
             className={`mt-1 w-full ${inputCls}`}
-            value={settings.numCtx}
+            value={settings.webllmCtx}
             min={2048}
+            max={40960}
             step={2048}
-            onChange={(e) => onSave({ numCtx: Number(e.target.value) || DEFAULT_SETTINGS.numCtx })}
+            onChange={(e) => onSave({ webllmCtx: Number(e.target.value) || DEFAULT_SETTINGS.webllmCtx })}
           />
+          <p className="mt-1 text-[10px] text-zinc-400">
+            Higher reads more of the page but uses more GPU memory. Qwen3 4B supports up to 40960; changing this reloads the model.
+          </p>
         </label>
-        <label className="flex-1">
-          <span className="text-zinc-500 dark:text-zinc-400">Temperature</span>
-          <input
-            type="number"
-            className={`mt-1 w-full ${inputCls}`}
-            value={settings.temperature}
-            min={0}
-            max={1}
-            step={0.1}
-            onChange={(e) => onSave({ temperature: Number(e.target.value) })}
-          />
-        </label>
-      </div>
+      )}
+
+      <label className="block">
+        <span className="text-zinc-500 dark:text-zinc-400">Temperature</span>
+        <input
+          type="number"
+          className={`mt-1 w-full ${inputCls}`}
+          value={settings.temperature}
+          min={0}
+          max={1}
+          step={0.1}
+          onChange={(e) => onSave({ temperature: Number(e.target.value) })}
+        />
+      </label>
       <label className="block">
         <span className="text-zinc-500 dark:text-zinc-400">System prompt</span>
         <textarea

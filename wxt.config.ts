@@ -11,9 +11,13 @@ export default defineConfig({
     name: 'Enclave',
     description:
       'A private, on-device AI that reads the page and answers your questions. Powered by a local model — nothing leaves your machine.',
-    permissions: ['sidePanel', 'contextMenus', 'storage', 'tabs', 'scripting'],
+    permissions: ['sidePanel', 'contextMenus', 'storage', 'tabs', 'scripting', 'offscreen'],
     // Only the local Ollama server is ever contacted.
     host_permissions: ['http://localhost:11434/*', 'http://127.0.0.1:11434/*'],
+    // WebLLM runs the model via WebAssembly + WebGPU, which requires 'wasm-unsafe-eval'.
+    content_security_policy: {
+      extension_pages: "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'",
+    },
     action: {
       default_title: 'Open Enclave',
     },
