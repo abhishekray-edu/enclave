@@ -53,7 +53,25 @@ adjustable in ⚙ and capped conservatively for stability.
 - A reasonably capable machine — more RAM/GPU lets you run the larger models.
 - Node 20+ and npm to build the extension.
 
-## Getting started
+## Install (no build)
+
+Grab the latest packaged build from the
+[**Releases**](https://github.com/abhishekray-edu/enclave/releases) page — no Node or build step required.
+
+1. Download `enclave-<version>-chrome.zip` and **unzip** it.
+2. Go to `chrome://extensions` and enable **Developer mode** (top right).
+3. **Load unpacked** → select the unzipped folder.
+4. Click the Enclave icon (or press **⌘⇧L** / **Ctrl+Shift+L**) to open the side panel.
+5. Ask a question. The first time, the model downloads with a progress bar; after that it's cached.
+
+> Firefox users: download `enclave-<version>-firefox.zip` instead and load it via
+> `about:debugging` → **This Firefox** → **Load Temporary Add-on**.
+
+Enclave isn't on the Chrome Web Store yet, so it installs as an unpacked extension — that's expected.
+
+## Build from source
+
+Prefer to build it yourself, or want live reload for development?
 
 ```bash
 git clone https://github.com/abhishekray-edu/enclave.git
@@ -62,12 +80,7 @@ npm install
 npm run build        # outputs .output/chrome-mv3   (use `npm run dev` for live reload)
 ```
 
-Load it in Chrome:
-
-1. Go to `chrome://extensions` and enable **Developer mode**.
-2. **Load unpacked** → select the `.output/chrome-mv3` folder.
-3. Click the Enclave icon (or press **⌘⇧L** / **Ctrl+Shift+L**) to open the side panel.
-4. Ask a question. The first time, the model downloads with a progress bar; after that it's cached.
+Then **Load unpacked** → select the `.output/chrome-mv3` folder, as above.
 
 That's it — no other software to install.
 

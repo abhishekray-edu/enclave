@@ -1,0 +1,39 @@
+name: Release
+
+# Builds the packaged extension and attaches the zips to a GitHub Release
+# whenever a v* tag is pushed (e.g. `git tag v0.1.0 && git push origin v0.1.0`).
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build & zip (Chrome + Firefox)
+        run: |
+          npm run zip
+          npm run zip:firefox
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            .output/*-chrome.zip
+            .output/*-firefox.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
