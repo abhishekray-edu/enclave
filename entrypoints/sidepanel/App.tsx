@@ -887,7 +887,11 @@ export default function App() {
     if (changedKeys.includes('webllmModel') || changedKeys.includes('webllmCtx')) schedulePreload(merged);
   }
 
-  const disabled = streaming;
+  // The selected model's weights aren't on disk yet: the in-chat card owns the flow, so
+  // lock the composer and quick actions until the download finishes (status leaves the
+  // needs-download / downloading states).
+  const composerLocked = onboardingVisible;
+  const disabled = streaming || composerLocked;
 
   return (
     <div className="flex h-full flex-col bg-zinc-100 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">
@@ -1061,15 +1065,16 @@ export default function App() {
       {/* Composer */}
       <div className="flex items-end gap-2 bg-white px-3 pt-2 pb-3 dark:bg-zinc-900">
         <textarea
-          className="max-h-32 min-h-[2.5rem] flex-1 resize-none rounded border border-zinc-300 px-2 py-1.5 text-sm focus:border-zinc-400 focus:outline-none dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:placeholder-zinc-500 dark:focus:border-zinc-500"
-          placeholder="Ask about this page…"
+          className="max-h-32 min-h-[2.5rem] flex-1 resize-none rounded border border-zinc-300 px-2 py-1.5 text-sm focus:border-zinc-400 focus:outline-none disabled:cursor-not-allowed disabled:bg-zinc-100 disabled:text-zinc-400 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:placeholder-zinc-500 dark:focus:border-zinc-500 dark:disabled:bg-zinc-800/60 dark:disabled:text-zinc-500"
+          placeholder={composerLocked ? 'Download the model to start chatting…' : 'Ask about this page…'}
           rows={1}
           value={input}
+          disabled={composerLocked}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               e.preventDefault();
-              submit(input);
+              if (!composerLocked) submit(input);
             }
           }}
         />
@@ -1083,7 +1088,7 @@ export default function App() {
         ) : (
           <button
             className="rounded bg-zinc-800 px-3 py-2 text-sm text-white hover:bg-zinc-700 disabled:opacity-40 dark:bg-zinc-700 dark:hover:bg-zinc-600"
-            disabled={!input.trim()}
+            disabled={!input.trim() || composerLocked}
             onClick={() => submit(input)}
           >
             Send
