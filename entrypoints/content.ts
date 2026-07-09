@@ -1,5 +1,5 @@
 import { Readability, isProbablyReaderable } from '@mozilla/readability';
-import type { GetPageContentRequest, PageBlock, PageContent, ScrollToTextRequest } from '@/lib/types';
+import type { GetPageContentRequest, PageBlock, PageContent } from '@/lib/types';
 
 const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'CANVAS', 'AUDIO', 'VIDEO']);
 const BLOCK_TAGS = new Set([
@@ -176,31 +176,6 @@ function collectViewport(): string {
   return parts.join(' ');
 }
 
-/** Find a snippet on the page, scroll it into view, and briefly highlight it. */
-function scrollToText(snippet: string): boolean {
-  const needle = snippet.replace(/\s+/g, ' ').trim().slice(0, 60).toLowerCase();
-  if (needle.length < 8 || !document.body) return false;
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  let node: Node | null;
-  while ((node = walker.nextNode())) {
-    const t = node.textContent?.replace(/\s+/g, ' ').toLowerCase() ?? '';
-    if (t.includes(needle)) {
-      const el = node.parentElement;
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        const orig = el.style.backgroundColor;
-        el.style.backgroundColor = 'rgba(250, 204, 21, 0.4)';
-        el.style.transition = 'background-color 0.4s';
-        setTimeout(() => {
-          el.style.backgroundColor = orig;
-        }, 1600);
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 function extractPage(wantViewport = false): PageContent {
   const selection = window.getSelection()?.toString() ?? '';
 
@@ -263,11 +238,9 @@ export default defineContentScript({
   matches: ['<all_urls>'],
   main() {
     browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-      const msg = message as GetPageContentRequest | ScrollToTextRequest | undefined;
+      const msg = message as GetPageContentRequest | undefined;
       if (msg?.type === 'GET_PAGE_CONTENT') {
         sendResponse(extractPage(Boolean(msg.wantViewport)));
-      } else if (msg?.type === 'SCROLL_TO_TEXT') {
-        sendResponse({ ok: scrollToText(String(msg.text ?? '')) });
       }
     });
   },

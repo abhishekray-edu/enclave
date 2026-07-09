@@ -42,20 +42,11 @@ export interface RetrievedChunk extends Chunk {
   score: number;
 }
 
-/** Provenance for an assistant answer: which page sections it drew from. */
-export interface MessageSource {
-  heading?: string;
-  snippet: string;
-  score: number;
-}
-
 export type ChatRole = 'user' | 'assistant' | 'system';
 
 export interface ChatMessage {
   role: ChatRole;
   content: string;
-  /** Page sections used to ground this answer (RAG provenance). */
-  sources?: MessageSource[];
   /** Structured (JSON) output for extraction tasks; content holds the raw JSON string. */
   structured?: { schemaId: string; data: unknown };
 }
@@ -108,12 +99,6 @@ export interface GetPageContentRequest {
   type: 'GET_PAGE_CONTENT';
   /** Also collect the text currently visible in the viewport (viewport-aware ranking). */
   wantViewport?: boolean;
-}
-
-/** Ask the content script to scroll a source snippet into view and highlight it. */
-export interface ScrollToTextRequest {
-  type: 'SCROLL_TO_TEXT';
-  text: string;
 }
 
 /** A quick action queued by the background worker (e.g. from the context menu). */

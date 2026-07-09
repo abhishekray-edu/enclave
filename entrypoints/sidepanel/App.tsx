@@ -35,10 +35,8 @@ import {
   MIN_CONTEXT_TOKENS,
   type ChatMessage,
   type GetPageContentRequest,
-  type MessageSource,
   type PageContent,
   type PendingAction,
-  type ScrollToTextRequest,
   type Settings,
   type Theme,
 } from '@/lib/types';
@@ -100,16 +98,6 @@ async function capturePage(wantViewport = false): Promise<PageContent> {
   }
 }
 
-/** Ask the active tab's content script to scroll a source snippet into view and highlight it. */
-async function jumpToSource(text: string) {
-  try {
-    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) await browser.tabs.sendMessage(tab.id, { type: 'SCROLL_TO_TEXT', text } satisfies ScrollToTextRequest);
-  } catch {
-    /* content script not reachable on this tab */
-  }
-}
-
 /** Remove Qwen-style <think>…</think> reasoning from displayed output.
  *  While a block is still open mid-stream, hide everything from it onward. */
 function stripThink(text: string): string {
@@ -140,30 +128,6 @@ function ThinkingIndicator() {
         <span />
       </span>
     </div>
-  );
-}
-
-/** Collapsible provenance: which page sections grounded a retrieval-based answer. */
-function SourcesList({ sources }: { sources: MessageSource[] }) {
-  return (
-    <details className="mt-2 border-t border-zinc-200 pt-1.5 text-[11px] text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
-      <summary className="cursor-pointer select-none">Sources ({sources.length})</summary>
-      <ul className="mt-1 space-y-1">
-        {sources.map((s, i) => (
-          <li key={i}>
-            <button
-              onClick={() => jumpToSource(s.snippet)}
-              className="w-full rounded bg-zinc-50 px-2 py-1 text-left hover:bg-zinc-100 dark:bg-zinc-900/50 dark:hover:bg-zinc-800"
-              title="Scroll to this section on the page"
-            >
-              {s.heading && <span className="font-medium text-zinc-600 dark:text-zinc-300">{s.heading}: </span>}
-              <span>{s.snippet}…</span>
-              <span className="ml-1 text-zinc-400">({Math.round(s.score * 100)}%)</span>
-            </button>
-          </li>
-        ))}
-      </ul>
-    </details>
   );
 }
 
@@ -836,21 +800,6 @@ export default function App() {
           setLastAssistant(acc);
         }
         if (!acc) setLastAssistant(controller.signal.aborted ? '_(stopped)_' : '_(no response)_');
-        if (acc && built.usedChunks?.length) {
-          const sources: MessageSource[] = [...built.usedChunks]
-            .sort((a, b) => b.score - a.score)
-            .map((c) => ({
-              heading: c.heading,
-              snippet: c.text.replace(/\s+/g, ' ').trim().slice(0, 140),
-              score: c.score,
-            }));
-          setMessages((prev) => {
-            const copy = [...prev];
-            const last = copy[copy.length - 1];
-            if (last?.role === 'assistant') copy[copy.length - 1] = { ...last, sources };
-            return copy;
-          });
-        }
       }
     } catch (e) {
       if (controller.signal.aborted) {
@@ -1040,18 +989,12 @@ export default function App() {
               ) : isPlaceholder ? (
                 <ThinkingIndicator />
               ) : m.structured ? (
-                <>
-                  <StructuredResult data={m.structured.data} raw={m.content} />
-                  {m.sources && m.sources.length > 0 && <SourcesList sources={m.sources} />}
-                </>
+                <StructuredResult data={m.structured.data} raw={m.content} />
               ) : (
-                <>
-                  {(() => {
-                    const display = stripThink(m.content);
-                    return display ? <Markdown content={display} /> : <ThinkingIndicator />;
-                  })()}
-                  {m.sources && m.sources.length > 0 && <SourcesList sources={m.sources} />}
-                </>
+                (() => {
+                  const display = stripThink(m.content);
+                  return display ? <Markdown content={display} /> : <ThinkingIndicator />;
+                })()
               )}
             </div>
           );

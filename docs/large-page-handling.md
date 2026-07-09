@@ -159,7 +159,7 @@ experimental. Failures degrade gracefully to the uncompressed chunks.
 
 ### Layer 4 — Task-specific generation
 
-- **Q&A** → stuff the top-k chunks (most-relevant last) and cite which chunks were used.
+- **Q&A** → stuff the top-k chunks (most-relevant last) so the answer stays grounded in them.
 - **Structured extraction** → **XGrammar constrained decoding** (`arXiv:2411.15100`, **high
   confidence**), which is already WebLLM's structured-generation backend: pass a JSON Schema via
   `response_format`, get structurally-valid JSON by construction. The guarantee is *structural*,
@@ -177,7 +177,7 @@ experimental. Failures degrade gracefully to the uncompressed chunks.
 
 | Task | Pipeline | Why |
 |---|---|---|
-| **Q&A** | clean → chunk → **retrieve top-k** → (compress) → stuff + cite | The answer usually lives in 1–3 sections; retrieval beats stuffing for small models |
+| **Q&A** | clean → chunk → **retrieve top-k** → (compress) → stuff | The answer usually lives in 1–3 sections; retrieval beats stuffing for small models |
 | **Summarize** | clean → chunk → **map-reduce** | Must cover the *whole* page; retrieval would drop content |
 | **Extract** | clean → (retrieve if over budget) → **XGrammar JSON** | Structural correctness by construction |
 

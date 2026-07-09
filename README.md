@@ -34,7 +34,7 @@ It's a Chrome **side-panel** extension: open it beside any tab and chat about wh
 - **Pick your model by RAM** — six options from a 1B lightweight to an 8B powerhouse.
 - **Reads the real page** — robust extraction across SPAs, shadow DOM, and same-origin iframes.
 - **Long pages done right** — on-device retrieval (RAG): pages are chunked, embedded, and the
-  most relevant sections retrieved, with **cited sources** you can click to scroll to on the page.
+  most relevant sections retrieved so the answer stays grounded in what matters.
   Whole-page summaries **map-reduce** over every section instead of truncating.
 - **Structured extraction** — pull article metadata, key facts, or contacts as JSON, with
   schema-constrained decoding (valid JSON by construction).
@@ -108,8 +108,8 @@ Then **Load unpacked** → select the `.output/chrome-mv3` folder, as above.
 ## Usage
 
 - **⌘⇧L / Ctrl+Shift+L** or the toolbar icon — open the side panel.
-- **Ask** — type any question about the current page. On long pages, answers cite the sections
-  they drew from; click a source to scroll to it.
+- **Ask** — type any question about the current page. On long pages, the most relevant sections
+  are retrieved so the answer stays grounded.
 - **Summarize** — one-click page summary; long pages are summarized section-by-section, then merged.
 - **Explain selection** — select text, then use the button or right-click → *Explain selection with local AI*.
 - **Extract…** — pull structured JSON (article metadata, key facts, contacts) out of the page.
@@ -121,7 +121,7 @@ A small local model can't take a 10,000-word page in one prompt — and on an in
 oversized prompt isn't just slow, it can starve the OS compositor. So Enclave never stuffs:
 
 ```
-clean → chunk → embed (MiniLM, cached in IndexedDB) → retrieve top-k → generate (+ cite sources)
+clean → chunk → embed (MiniLM, cached in IndexedDB) → retrieve top-k → generate
 ```
 
 Whole-page summaries map-reduce over all chunks, structured extraction uses grammar-constrained

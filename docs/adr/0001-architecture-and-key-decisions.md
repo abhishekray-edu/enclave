@@ -64,7 +64,7 @@ GPU can starve the OS compositor (see the post-mortem in
 [docs/large-page-handling.md](../large-page-handling.md)). Every model therefore declares a
 hard `safePromptTokens` cap on any single prompt, and over-budget pages route through a
 client-side pipeline — clean → chunk → embed (MiniLM, cached in IndexedDB) → retrieve top-k →
-generate with cited sources; whole-page summaries map-reduce over all chunks; structured
+generate; whole-page summaries map-reduce over all chunks; structured
 extraction uses XGrammar-constrained JSON. The caps are pinned by `lib/__tests__/budgets.test.ts`.
 
 **Reasoning models.** When a hybrid reasoning model (e.g. Qwen3) is used, its `<think>` phase
