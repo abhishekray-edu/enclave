@@ -49,19 +49,22 @@ export default defineBackground(() => {
     });
   });
 
-  browser.contextMenus.onClicked.addListener(async (info, tab) => {
+  browser.contextMenus.onClicked.addListener((info, tab) => {
     if (info.menuItemId !== MENU_ID || !tab?.id || tab.windowId === undefined) return;
-    await setPending({ action: 'explain', selection: info.selectionText ?? '' });
-    await browser.sidePanel.open({ windowId: tab.windowId });
+    // sidePanel.open() only works while the user gesture (the context-menu click) is still
+    // active, so it must be called synchronously here — awaiting anything first (e.g. the
+    // storage write) drops the gesture and Chrome rejects the open. Fire the pending-action
+    // write without awaiting; it completes long before the panel's bundle loads and reads it.
+    void setPending({ action: 'explain', selection: info.selectionText ?? '' });
+    browser.sidePanel.open({ windowId: tab.windowId }).catch((err) => console.error('sidePanel.open failed', err));
   });
 
-  // Keyboard shortcut (Cmd/Ctrl+Shift+L) opens the panel.
-  browser.commands.onCommand.addListener(async (command) => {
-    if (command !== 'open-panel') return;
-    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-    if (tab?.windowId !== undefined) {
-      await browser.sidePanel.open({ windowId: tab.windowId });
-    }
+  // Keyboard shortcut (Cmd/Ctrl+Shift+L) opens the panel. Use the tab passed to the listener
+  // rather than querying for it: awaiting a query first would drop the user gesture and Chrome
+  // would reject sidePanel.open().
+  browser.commands.onCommand.addListener((command, tab) => {
+    if (command !== 'open-panel' || tab?.windowId === undefined) return;
+    browser.sidePanel.open({ windowId: tab.windowId }).catch((err) => console.error('sidePanel.open failed', err));
   });
 
   // Offscreen document lifecycle (hosts the in-browser WebLLM engine).
