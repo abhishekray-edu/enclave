@@ -101,16 +101,22 @@ browser.runtime.onConnect.addListener((port) => {
 
     if (msg.type === 'prewarmModel') {
       // Warm start: load only when the weights are already on disk — a prewarm must never
-      // kick off a multi-GB download the user didn't ask for. And only an explicit model
-      // switch (supersede) may displace a different model that is still mid-load; a
-      // background warm-up never cancels a download the user started.
+      // kick off a NEW multi-GB download the user didn't ask for. But if this exact model is
+      // already downloading (e.g. the panel was reopened while a download runs in the
+      // background), attach to that in-flight load and stream its progress — that's resuming
+      // a download already consented to, not starting one. Only an explicit switch
+      // (supersede) may displace a DIFFERENT model that is still mid-load.
       try {
-        const cached = await isModelCached(msg.model);
-        const busyWithOther =
+        const inFlight =
           loader.loading !== null &&
-          !(loader.loading.model === msg.model && loader.loading.ctx === msg.contextWindowSize);
-        const loadable = cached && (!busyWithOther || msg.supersede === true);
+          loader.loading.model === msg.model &&
+          loader.loading.ctx === msg.contextWindowSize;
+        const cached = await isModelCached(msg.model);
+        const busyWithOther = loader.loading !== null && !inFlight;
+        const loadable = (cached || inFlight) && (!busyWithOther || msg.supersede === true);
         if (loadable) {
+          // A not-yet-cached model that is loadable can only be one already downloading.
+          send(port, { type: 'prewarmStarted', id: msg.id, downloading: inFlight && !cached });
           await ensureModel(msg.model, msg.contextWindowSize, (text, progress) =>
             send(port, { type: 'progress', id: msg.id, report: { text, progress } }),
           );

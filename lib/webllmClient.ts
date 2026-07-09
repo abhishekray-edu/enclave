@@ -97,6 +97,9 @@ export type PanelToOffscreen =
 export type OffscreenToPanel =
   | { type: 'progress'; id: number; report: LoadProgress }
   | { type: 'ready'; id: number }
+  // Sent once a prewarm decides to stage the model, before the (possibly long) load: it says
+  // whether that load is a fast GPU load from cache or attaches to a download already running.
+  | { type: 'prewarmStarted'; id: number; downloading: boolean }
   | { type: 'prewarmed'; id: number; loaded: boolean }
   | { type: 'chunk'; id: number; delta: string }
   | { type: 'result'; id: number; content: string }
@@ -178,13 +181,15 @@ export function initModel(
  *  are already downloaded (never triggers a multi-GB download). Resolves with whether the
  *  model ended up loaded. Best-effort — callers should swallow rejections.
  *  `supersede` marks an explicit model/context switch: it may cancel a different model's
- *  in-flight load (newest choice wins); a background warm-up must leave that flag off. */
+ *  in-flight load (newest choice wins); a background warm-up must leave that flag off.
+ *  `onStart` fires once staging begins, reporting whether it attaches to a running download
+ *  (so the caller can show a download vs a quick cache-load state before progress arrives). */
 export function prewarmModel(
   port: WebllmPort,
   model: string,
   contextWindowSize: number,
   onProgress: (p: LoadProgress) => void,
-  opts?: { supersede?: boolean },
+  opts?: { supersede?: boolean; onStart?: (downloading: boolean) => void },
 ): Promise<boolean> {
   const id = --nextInitId;
   return new Promise((resolve, reject) => {
@@ -192,6 +197,7 @@ export function prewarmModel(
       const msg = raw as OffscreenToPanel;
       if (msg.id !== id) return;
       if (msg.type === 'progress') onProgress(msg.report);
+      else if (msg.type === 'prewarmStarted') opts?.onStart?.(msg.downloading);
       else if (msg.type === 'prewarmed') {
         cleanup();
         resolve(msg.loaded);

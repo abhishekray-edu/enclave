@@ -474,9 +474,22 @@ export default function App() {
       const port = await getWebllmPort();
       if (abortRef.current || !engineOpCurrent(epoch)) return;
       setModelStatus((cur) => (cur === 'ready' ? cur : 'loading'));
-      const loaded = await prewarmModel(port, s.webllmModel, contextForSettings(s), (p) => {
-        if (engineOpCurrent(epoch)) setLoadProgress(p);
-      });
+      const loaded = await prewarmModel(
+        port,
+        s.webllmModel,
+        contextForSettings(s),
+        (p) => {
+          if (engineOpCurrent(epoch)) setLoadProgress(p);
+        },
+        {
+          // A download already running in the offscreen doc (e.g. the panel was reopened
+          // mid-download) is resumed here: show it as downloading so the card and its
+          // progress reappear instead of a bare "needs download".
+          onStart: (downloading) => {
+            if (downloading && engineOpCurrent(epoch)) setModelStatus('downloading');
+          },
+        },
+      );
       if (engineOpCurrent(epoch)) setModelStatus(loaded ? 'ready' : 'needs-download');
     } catch {
       // A failed prewarm never demotes a model that is already resident.
