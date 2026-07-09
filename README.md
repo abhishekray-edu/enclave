@@ -6,7 +6,12 @@
 
 **Run LLMs locally in your browser, on your own GPU. Nothing ever leaves your machine.**
 
-Ask about the page you're on, summarize it, or explain a selection — no accounts, no servers, no setup.
+Ask about the page you're on, summarize it, explain a selection, or extract structured data —
+no accounts, no servers, no setup.
+
+[![CI](https://github.com/abhishekray-edu/enclave/actions/workflows/ci.yml/badge.svg)](https://github.com/abhishekray-edu/enclave/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/abhishekray-edu/enclave)](https://github.com/abhishekray-edu/enclave/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
 
@@ -19,16 +24,25 @@ your questions stay on your machine, with nothing to install or configure.
 
 It's a Chrome **side-panel** extension: open it beside any tab and chat about what's on screen.
 
+<!-- TODO: screenshot / demo GIF here -->
+
 ## Features
 
-- **Fully local & private** — the model runs in your browser; your data never leaves the device.
+- **Fully local & private** — inference runs in your browser on WebGPU; page content and
+  questions never leave the device.
 - **Zero setup** — no server, no account, no API key. Install the extension and ask.
 - **Pick your model by RAM** — six options from a 1B lightweight to an 8B powerhouse.
 - **Reads the real page** — robust extraction across SPAs, shadow DOM, and same-origin iframes.
-- **Quick actions** — Ask about the page, Summarize, or Explain a selection (also via right-click).
-- **Clean answers** — Markdown with syntax-highlighted, copyable code blocks.
-- **Polished UI** — neutral light/dark theme that follows your system.
-- **Stays warm** — the model is kept resident in the background, so follow-up questions are instant.
+- **Long pages done right** — on-device retrieval (RAG): pages are chunked, embedded, and the
+  most relevant sections retrieved, with **cited sources** you can click to scroll to on the page.
+  Whole-page summaries **map-reduce** over every section instead of truncating.
+- **Structured extraction** — pull article metadata, key facts, or contacts as JSON, with
+  schema-constrained decoding (valid JSON by construction).
+- **Quick actions** — Ask, Summarize, Explain a selection (also via right-click), Extract.
+- **Fast when it matters** — the page is indexed and the model staged as soon as the panel
+  opens, and the model stays resident across panel open/close for instant follow-ups.
+- **Clean answers** — Markdown with syntax-highlighted, copyable code blocks, in a neutral
+  light/dark theme that follows your system.
 
 ## Models
 
@@ -47,11 +61,18 @@ once on first use (cached afterwards), and you can switch anytime.
 Larger models give better answers but need more GPU memory. The **context window** is
 adjustable in ⚙ and capped conservatively for stability.
 
+## Privacy
+
+- Your page content, selections, and questions are processed **entirely on-device** and are
+  never sent anywhere.
+- The only network traffic is the **one-time download of model weights** (from the WebLLM /
+  Hugging Face CDNs), which are then cached locally.
+- No telemetry, no analytics, no accounts.
+
 ## Requirements
 
 - A Chromium browser with **WebGPU** (recent Chrome, Edge, Brave, Arc…).
 - A reasonably capable machine — more RAM/GPU lets you run the larger models.
-- Node 20+ and npm to build the extension.
 
 ## Install (no build)
 
@@ -71,7 +92,7 @@ Enclave isn't on the Chrome Web Store yet, so it installs as an unpacked extensi
 
 ## Build from source
 
-Prefer to build it yourself, or want live reload for development?
+Prefer to build it yourself, or want live reload for development? You'll need **Node 20+**.
 
 ```bash
 git clone https://github.com/abhishekray-edu/enclave.git
@@ -82,70 +103,76 @@ npm run build        # outputs .output/chrome-mv3   (use `npm run dev` for live 
 
 Then **Load unpacked** → select the `.output/chrome-mv3` folder, as above.
 
-That's it — no other software to install.
-
 ## Usage
 
 - **⌘⇧L / Ctrl+Shift+L** or the toolbar icon — open the side panel.
-- **Ask** — type any question about the current page.
-- **Summarize** — one-click page summary.
+- **Ask** — type any question about the current page. On long pages, answers cite the sections
+  they drew from; click a source to scroll to it.
+- **Summarize** — one-click page summary; long pages are summarized section-by-section, then merged.
 - **Explain selection** — select text, then use the button or right-click → *Explain selection with local AI*.
+- **Extract…** — pull structured JSON (article metadata, key facts, contacts) out of the page.
 - **⚙** — switch model, context window, theme, temperature, and **Release model from memory**.
+
+## How it handles large pages
+
+A small local model can't take a 10,000-word page in one prompt — and on an integrated GPU an
+oversized prompt isn't just slow, it can starve the OS compositor. So Enclave never stuffs:
+
+```
+clean → chunk → embed (MiniLM, cached in IndexedDB) → retrieve top-k → generate (+ cite sources)
+```
+
+Whole-page summaries map-reduce over all chunks, structured extraction uses grammar-constrained
+JSON decoding, and every single prompt is bounded by a per-model safety cap that is pinned by
+tests. The research notes and the post-mortem behind those caps live in
+[docs/large-page-handling.md](docs/large-page-handling.md).
 
 ## Architecture
 
 ```
-  Browser tab                         Side panel (React)              Offscreen document
- ┌──────────────┐   page text/      ┌─────────────────────┐  Port   ┌────────────────────────┐
- │ content      │── selection ─────▶│  chat UI · prompt    │───────▶ │ WebLLM engine on WebGPU │
- │ script       │  (Readability +   │  builder · markdown  │         │ stays resident in memory│
- │              │   deep DOM walk)   │  renderer            │ ◀tokens─└────────────────────────┘
- └──────────────┘                   └─────────────────────┘
-   Background worker: opens the panel · context menu · offscreen-document lifecycle
+  Browser tab                      Side panel (React)                Offscreen document
+ ┌──────────────┐  page text +   ┌──────────────────────┐   Port   ┌───────────────────────────────┐
+ │ content      │─ structure + ─▶│ chat UI · task router │─────────▶│ webllm.worker — LLM on WebGPU │
+ │ script       │  selection     │ prompt builder (RAG)  │◀─tokens──│ ml.worker — embed · retrieve  │
+ └──────────────┘                └──────────────────────┘          │             · compress        │
+                                                                   └───────────────────────────────┘
+  Background worker: opens the panel · context menu · offscreen-document lifecycle
+  (the offscreen document keeps models resident across panel open/close)
 ```
 
-- **`entrypoints/content.ts`** — extracts clean page text (Mozilla Readability, with a deep DOM
-  walk that crosses shadow DOM and same-origin iframes) plus the current selection.
-- **`entrypoints/sidepanel/`** — the React UI: chat, prompt building, markdown rendering.
-- **`entrypoints/offscreen/`** — hosts the WebLLM engine in a persistent hidden document so the
-  model stays loaded across panel open/close. The panel talks to it over a Port.
+- **`entrypoints/content.ts`** — extracts clean page text (Mozilla Readability, plus a deep DOM
+  walk that crosses shadow DOM and same-origin iframes) with document structure and the selection.
+- **`entrypoints/sidepanel/`** — the React UI: chat, task routing, prompt building, markdown rendering.
+- **`entrypoints/offscreen/`** — hosts the models in a persistent hidden document so they stay
+  loaded across panel open/close. The LLM and the embedding/compression models each run in their
+  own dedicated worker, so the UI never blocks on model work.
 - **`entrypoints/background.ts`** — thin glue: panel behavior, keyboard command, context menu,
   and offscreen-document lifecycle.
-- **`lib/`** — `webllm.ts` (engine, offscreen-only), `webllmClient.ts` (panel port client +
-  model catalog), `prompt.ts` (context-budgeted prompt builder), `settings.ts`, `theme.ts`, `types.ts`.
+- **`lib/`** — the pipeline: `prompt.ts` (context-budgeted prompt builder), `chunking.ts`
+  (structure-aware chunking), `retrieval.ts` (MiniLM embeddings + IndexedDB vector cache),
+  `summarize.ts` (hierarchical map-reduce), `tasks.ts` (task specs + extraction schemas),
+  `compress.ts` (optional LLMLingua-2 compression), `webllm.ts` / `webllmClient.ts` (engine and
+  its panel-side client + model catalog with per-model safety caps), `ortEnv.ts`, `settings.ts`,
+  `theme.ts`, `types.ts`.
 
-The heavy WebLLM runtime is isolated to the offscreen bundle, keeping the side-panel bundle small.
+The heavy ML runtimes (WebLLM, Transformers.js) are isolated to the offscreen bundle, keeping
+the side-panel bundle small.
 
 The reasoning behind the core design is in a single
-[Architecture Decision Record](docs/adr/0001-architecture-and-key-decisions.md).
-
-## Privacy
-
-All processing happens on your own hardware, inside the browser. Page content and your
-questions go only to the local model. The engine downloads model weights once (from the
-WebLLM/Hugging Face CDN) and caches them locally. Enclave ships with no analytics or telemetry.
-
-## Tech stack
-
-[WXT](https://wxt.dev) · React · TypeScript · Tailwind CSS v4 ·
-[@mlc-ai/web-llm](https://github.com/mlc-ai/web-llm) (WebGPU) ·
-[@mozilla/readability](https://github.com/mozilla/readability) · react-markdown · highlight.js
+[Architecture Decision Record](docs/adr/0001-architecture-and-key-decisions.md); the large-page
+pipeline has its own [design notes](docs/large-page-handling.md).
 
 ## Development
 
 ```bash
-npm run dev        # live-reload dev build (.output/chrome-mv3-dev)
-npm run build      # production build
-npm run compile    # type-check (tsc --noEmit)
-npm run icons      # regenerate PNG icons from public/logo.svg
-npm run zip        # package for distribution
+npm run dev        # live-reload dev build (Chrome)
+npm run compile    # typecheck
+npm test           # unit tests (vitest)
+npm run zip        # package a release zip
 ```
 
-## Roadmap
-
-- **v2** — persistent per-site chat history, PDF support, vision (screenshots → multimodal models).
-- **v3** — retrieval (RAG) over multiple pages and notes; the start of the broader private-workspace vision.
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE) © Abhishek Ray

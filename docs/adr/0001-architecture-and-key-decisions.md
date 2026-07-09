@@ -1,7 +1,7 @@
 # ADR 0001 — In-browser (WebGPU) architecture
 
 - **Status:** Accepted
-- **Date:** 2026-06-19
+- **Date:** 2026-06-19 (updated 2026-07-09: large-page pipeline, dedicated workers, per-model prompt caps)
 
 Enclave runs a model **entirely in the browser, on the user's GPU** — private, on-device, and
 installable with nothing else to set up. This record describes that design and how it works.
@@ -36,18 +36,34 @@ resident for the browser session. This keeps the model loaded across panel open/
 follow-up questions are instant.
 
 - **Port protocol:** the panel is a thin client that talks to the offscreen document over a
-  `runtime.Port` — `init` to load/confirm the model, `generate` to run it; the offscreen doc
-  streams `progress`, then token `chunk`s, then `done`, and honors `interrupt`.
+  `runtime.Port` — `init`/`prewarmModel` to load or stage the model, `generate` to run it,
+  `index`/`retrieve`/`compress` for the retrieval pipeline; the offscreen doc streams
+  `progress`, then token `chunk`s, then `done`, and honors `interrupt`.
+- **Dedicated workers:** inside the offscreen document, the WebLLM engine runs in its own
+  worker (`webllm.worker.ts`) and the embedding/compression models in another (`ml.worker.ts`).
+  The offscreen document often shares the renderer main thread with the side panel, so keeping
+  model work off that thread is what keeps the panel clickable during weight loading and indexing.
 - **Lifecycle:** the background worker creates the offscreen document on demand. Changing the
-  model or context window reloads the engine automatically (debounced), so it's ready before
-  the next message. A **"Release model from memory"** control closes the document to reclaim
-  RAM/VRAM; it reloads on the next question.
-- **Bundle split:** the heavy WebLLM runtime is imported only by the offscreen document, so the
-  side-panel bundle stays small (~0.5 MB).
+  model or context window reloads the engine automatically (debounced), and the panel prewarms
+  on open and tab switch (indexing the page, and loading the model only if its weights are
+  already cached — a prewarm never triggers a multi-GB download). A **"Release model from
+  memory"** control closes the document to reclaim RAM/VRAM; it reloads on the next question.
+- **Bundle split:** the heavy WebLLM and Transformers.js runtimes are imported only by the
+  offscreen bundles, so the side-panel bundle stays small (~0.5 MB).
 
-**Reasoning models.** When a hybrid reasoning model (e.g. Qwen3) is used, its `<think>`
-output is disabled (via the model's soft switch on the user turn) and stripped from the
-display, keeping answers fast and clean.
+**Large pages.** Small models must not be handed a huge prompt — for answer quality
+("lost in the middle") and for system stability: a single oversized prefill on an integrated
+GPU can starve the OS compositor (see the post-mortem in
+[docs/large-page-handling.md](../large-page-handling.md)). Every model therefore declares a
+hard `safePromptTokens` cap on any single prompt, and over-budget pages route through a
+client-side pipeline — clean → chunk → embed (MiniLM, cached in IndexedDB) → retrieve top-k →
+generate with cited sources; whole-page summaries map-reduce over all chunks; structured
+extraction uses XGrammar-constrained JSON. The caps are pinned by `lib/__tests__/budgets.test.ts`.
+
+**Reasoning models.** When a hybrid reasoning model (e.g. Qwen3) is used, its `<think>` phase
+is disabled outright via the chat-template flag (`enable_thinking: false`; the soft `/no_think`
+text hint proved unreliable), and any stray tags are stripped from the display — visible tokens
+start when prefill ends instead of after a hidden reasoning phase.
 
 **Page extraction.** A visibility-aware deep DOM walk — which also crosses shadow DOM and
 same-origin iframes — captures what's on app-like and SPA pages; Mozilla Readability is used as
@@ -56,12 +72,13 @@ a cleanup pass for genuine articles. The extracted text feeds the prompt.
 ## How it connects
 
 ```
- Content script ── deep DOM text (shadow DOM + same-origin iframes) ──▶ Side panel (thin UI)
-                                                                              │ runtime.Port
-                                                                              ▼
-                                                              Offscreen document
-                                                              WebLLM engine on WebGPU
-                                                              (downloads once, stays resident)
+ Content script ── deep DOM text + structure (shadow DOM, same-origin iframes) ──▶ Side panel (thin UI)
+                                                                                        │ runtime.Port
+                                                                                        ▼
+                                                                    Offscreen document (stays resident)
+                                                                    ├─ webllm.worker — LLM on WebGPU
+                                                                    └─ ml.worker — embeddings · retrieval
+                                                                                   · compression
  Background worker: opens the panel, manages the offscreen document
 ```
 
