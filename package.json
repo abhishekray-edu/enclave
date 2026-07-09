@@ -18,10 +18,13 @@
     "zip": "wxt zip",
     "zip:firefox": "wxt zip -b firefox",
     "compile": "tsc --noEmit",
+    "test": "vitest run",
     "icons": "node scripts/gen-icons.mjs",
     "postinstall": "wxt prepare"
   },
   "dependencies": {
+    "@atjsh/llmlingua-2": "^2.0.3",
+    "@huggingface/transformers": "^4.2.0",
     "@mlc-ai/web-llm": "^0.2.84",
     "@mozilla/readability": "^0.6.0",
     "dompurify": "^3.4.11",
@@ -39,6 +42,7 @@
     "sharp": "^0.35.1",
     "tailwindcss": "^4.3.1",
     "typescript": "^5.9.3",
+    "vitest": "^4.1.9",
     "wxt": "^0.20.26"
   }
 }
