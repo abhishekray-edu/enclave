@@ -86,7 +86,8 @@ export interface GenerateOptions {
 // ---- Port protocol between the side panel and the offscreen document ----
 export type PanelToOffscreen =
   | { type: 'init'; id: number; model: string; contextWindowSize: number }
-  | { type: 'prewarmModel'; id: number; model: string; contextWindowSize: number }
+  | { type: 'prewarmModel'; id: number; model: string; contextWindowSize: number; supersede?: boolean }
+  | { type: 'cancelLoad'; model: string; contextWindowSize: number }
   | { type: 'generate'; id: number; messages: ChatMessage[]; options: GenerateOptions }
   | { type: 'index'; id: number; url: string; contentHash: string; chunks: Chunk[] }
   | { type: 'retrieve'; id: number; url: string; contentHash: string; query: string; topK: number }
@@ -120,12 +121,15 @@ export async function releaseOffscreen(): Promise<void> {
   await browser.runtime.sendMessage({ type: 'RELEASE_OFFSCREEN' });
 }
 
-/** Load (or confirm already-loaded) the model in the offscreen doc; resolves on ready. */
+/** Load (or confirm already-loaded) the model in the offscreen doc; resolves on ready.
+ *  Aborting the signal cancels the load itself — including an in-flight weight download,
+ *  which resumes later from its cached shards — and rejects with an AbortError. */
 export function initModel(
   port: WebllmPort,
   model: string,
   contextWindowSize: number,
   onProgress: (p: LoadProgress) => void,
+  signal?: AbortSignal,
 ): Promise<void> {
   const id = --nextInitId;
   return new Promise((resolve, reject) => {
@@ -145,24 +149,42 @@ export function initModel(
       cleanup();
       reject(new Error('In-browser model host disconnected.'));
     };
+    const onAbort = () => {
+      try {
+        port.postMessage({ type: 'cancelLoad', model, contextWindowSize } satisfies PanelToOffscreen);
+      } catch {
+        /* port already gone */
+      }
+      cleanup();
+      reject(new DOMException('Aborted', 'AbortError'));
+    };
     function cleanup() {
       port.onMessage.removeListener(onMsg);
       port.onDisconnect.removeListener(onDisc);
+      signal?.removeEventListener('abort', onAbort);
+    }
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
     }
     port.onMessage.addListener(onMsg);
     port.onDisconnect.addListener(onDisc);
+    signal?.addEventListener('abort', onAbort, { once: true });
     port.postMessage({ type: 'init', id, model, contextWindowSize } satisfies PanelToOffscreen);
   });
 }
 
 /** Warm the model ahead of the first question: loads it into the GPU only when its weights
  *  are already downloaded (never triggers a multi-GB download). Resolves with whether the
- *  model ended up loaded. Best-effort — callers should swallow rejections. */
+ *  model ended up loaded. Best-effort — callers should swallow rejections.
+ *  `supersede` marks an explicit model/context switch: it may cancel a different model's
+ *  in-flight load (newest choice wins); a background warm-up must leave that flag off. */
 export function prewarmModel(
   port: WebllmPort,
   model: string,
   contextWindowSize: number,
   onProgress: (p: LoadProgress) => void,
+  opts?: { supersede?: boolean },
 ): Promise<boolean> {
   const id = --nextInitId;
   return new Promise((resolve, reject) => {
@@ -188,7 +210,13 @@ export function prewarmModel(
     }
     port.onMessage.addListener(onMsg);
     port.onDisconnect.addListener(onDisc);
-    port.postMessage({ type: 'prewarmModel', id, model, contextWindowSize } satisfies PanelToOffscreen);
+    port.postMessage({
+      type: 'prewarmModel',
+      id,
+      model,
+      contextWindowSize,
+      supersede: opts?.supersede,
+    } satisfies PanelToOffscreen);
   });
 }
 

@@ -3,17 +3,27 @@
 import { browser } from 'wxt/browser';
 import type { WebWorkerMLCEngine } from '@mlc-ai/web-llm';
 import { createWebllmEngine, chatStreamWebllm, chatCompleteWebllm, isModelCached } from '@/lib/webllm';
+import { createModelLoader } from '@/lib/modelLoader';
 import { PORT_NAME, type OffscreenToPanel, type PanelToOffscreen, type WebllmPort } from '@/lib/webllmClient';
 // NOTE: lib/retrieval (Transformers.js + onnxruntime) and lib/compress (LLMLingua-2) run in
 // a dedicated worker (ml.worker.ts, created lazily) so a plain Q&A never loads that heavy
 // machinery AND embedding never blocks this document's main thread — the side panel usually
 // shares it, so a busy main thread here freezes the panel UI.
 
-let engine: WebWorkerMLCEngine | null = null;
-let engineWorker: Worker | null = null;
-let loadedModel: string | null = null;
-let loadedCtx: number | null = null;
-let loadQueue: Promise<void> = Promise.resolve();
+/** Owns the single resident engine. Loads never queue: an identical request joins the one
+ *  in flight, a different one cancels it (newest wins — a canceled download resumes later
+ *  from its cached shards, so nothing is lost). */
+const loader = createModelLoader<WebWorkerMLCEngine, Worker>({
+  // The engine lives in a dedicated worker: weight deserialization and generation would
+  // otherwise run on this document's main thread, which the side panel usually shares —
+  // freezing its UI for the duration.
+  spawnWorker: () => new Worker(new URL('./webllm.worker.ts', import.meta.url), { type: 'module' }),
+  terminateWorker: (worker) => worker.terminate(),
+  createEngine: (worker, model, ctx, onProgress) =>
+    createWebllmEngine(worker, model, ctx, (r) => onProgress(r.text, r.progress)),
+  unloadEngine: (engine) => engine.unload(),
+});
+
 let abort: AbortController | null = null;
 let activeId: number | null = null;
 
@@ -65,42 +75,10 @@ async function ensureModel(
   ctx: number,
   onProgress: (text: string, progress: number) => void,
 ) {
-  const load = async () => {
-    if (engine && loadedModel === model && loadedCtx === ctx) return;
-    if (!('gpu' in navigator)) {
-      throw new Error('WebGPU is not available, so the in-browser engine cannot run.');
-    }
-    if (engine) {
-      try {
-        await engine.unload();
-      } catch {
-        /* ignore */
-      }
-      engineWorker?.terminate();
-      engine = null;
-      engineWorker = null;
-      loadedModel = null;
-      loadedCtx = null;
-    }
-
-    // The engine lives in a dedicated worker: weight deserialization and generation would
-    // otherwise run on this document's main thread, which the side panel usually shares —
-    // freezing its UI for the duration.
-    const worker = new Worker(new URL('./webllm.worker.ts', import.meta.url), { type: 'module' });
-    try {
-      engine = await createWebllmEngine(worker, model, ctx, (r) => onProgress(r.text, r.progress));
-    } catch (e) {
-      worker.terminate();
-      throw e;
-    }
-    engineWorker = worker;
-    loadedModel = model;
-    loadedCtx = ctx;
-  };
-
-  const queuedLoad = loadQueue.then(load, load);
-  loadQueue = queuedLoad.catch(() => {});
-  await queuedLoad;
+  if (!('gpu' in navigator)) {
+    throw new Error('WebGPU is not available, so the in-browser engine cannot run.');
+  }
+  await loader.ensure(model, ctx, onProgress);
 }
 
 browser.runtime.onConnect.addListener((port) => {
@@ -123,22 +101,36 @@ browser.runtime.onConnect.addListener((port) => {
 
     if (msg.type === 'prewarmModel') {
       // Warm start: load only when the weights are already on disk — a prewarm must never
-      // kick off a multi-GB download the user didn't ask for.
+      // kick off a multi-GB download the user didn't ask for. And only an explicit model
+      // switch (supersede) may displace a different model that is still mid-load; a
+      // background warm-up never cancels a download the user started.
       try {
         const cached = await isModelCached(msg.model);
-        if (cached) {
+        const busyWithOther =
+          loader.loading !== null &&
+          !(loader.loading.model === msg.model && loader.loading.ctx === msg.contextWindowSize);
+        const loadable = cached && (!busyWithOther || msg.supersede === true);
+        if (loadable) {
           await ensureModel(msg.model, msg.contextWindowSize, (text, progress) =>
             send(port, { type: 'progress', id: msg.id, report: { text, progress } }),
           );
         }
-        send(port, { type: 'prewarmed', id: msg.id, loaded: cached });
+        send(port, { type: 'prewarmed', id: msg.id, loaded: loadable });
       } catch (e) {
         send(port, { type: 'error', id: msg.id, message: errStr(e) });
       }
       return;
     }
 
+    if (msg.type === 'cancelLoad') {
+      // Stop an in-flight load/download (the panel's Stop, or a retarget). Already-fetched
+      // weight shards stay in the browser cache, so a canceled download resumes later.
+      loader.cancel(msg.model, msg.contextWindowSize);
+      return;
+    }
+
     if (msg.type === 'generate') {
+      const engine = loader.engine;
       if (!engine) {
         send(port, { type: 'error', id: msg.id, message: 'Model not loaded.' });
         return;
@@ -195,7 +187,7 @@ browser.runtime.onConnect.addListener((port) => {
       if (msg.id === undefined || msg.id === activeId) {
         abort?.abort();
         try {
-          engine?.interruptGenerate();
+          loader.engine?.interruptGenerate();
         } catch {
           /* ignore */
         }

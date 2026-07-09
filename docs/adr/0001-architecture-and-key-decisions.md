@@ -46,7 +46,11 @@ follow-up questions are instant.
 - **Lifecycle:** the background worker creates the offscreen document on demand. Changing the
   model or context window reloads the engine automatically (debounced), and the panel prewarms
   on open and tab switch (indexing the page, and loading the model only if its weights are
-  already cached — a prewarm never triggers a multi-GB download). On a fresh install the panel
+  already cached — a prewarm never triggers a multi-GB download). Loads never queue: a request
+  for the model already loading joins it, and a request for a different one cancels it — the
+  newest choice wins, and a canceled download loses nothing (fetched weight shards stay in the
+  browser cache, so it resumes where it stopped). A background prewarm never cancels a load the
+  user started explicitly. On a fresh install the panel
   shows a first-run model picker instead (the default is suggested from the device's reported
   memory) and downloads only on explicit confirmation — or when the user just asks a question.
   A **"Release model from memory"** control closes the document to reclaim RAM/VRAM; it

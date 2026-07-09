@@ -21,6 +21,7 @@ import {
   type LoadProgress,
   type WebllmPort,
 } from '@/lib/webllmClient';
+import { isLoadInterruption } from '@/lib/modelLoader';
 import { buildMessages, pageBudgetTokens, estimateTokens, type BuiltPrompt } from '@/lib/prompt';
 import { chunkPage } from '@/lib/chunking';
 import { summarizeChunks } from '@/lib/summarize';
@@ -266,6 +267,9 @@ export default function App() {
   /** Error surfaced inside the first-run card (download failures). */
   const [onboardError, setOnboardError] = useState<string | null>(null);
   const suggestedModelId = defaultModelForDevice();
+  /** The model card is the one place downloads happen: it shows whenever the selected
+   *  model's weights aren't on disk — on first run and mid-chat alike. */
+  const onboardingVisible = modelStatus === 'needs-download' || modelStatus === 'downloading';
 
   // Long-lived port to the offscreen document that hosts the in-browser engine.
   const portRef = useRef<WebllmPort | null>(null);
@@ -283,6 +287,28 @@ export default function App() {
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
+
+  // Engine operations (download, preload, prewarm, question) can overlap — e.g. switching
+  // back to a cached model while another downloads. Whichever started last owns the
+  // status/progress UI: older operations' writes are stale and stay silent.
+  const engineOpEpochRef = useRef(0);
+  const engineOpRef = useRef<number | null>(null);
+
+  /** Claim ownership of the model status/progress UI for one engine operation. */
+  function beginEngineOp(): number {
+    const epoch = ++engineOpEpochRef.current;
+    engineOpRef.current = epoch;
+    return epoch;
+  }
+
+  function endEngineOp(epoch: number) {
+    if (engineOpRef.current === epoch) engineOpRef.current = null;
+  }
+
+  /** True while no newer engine operation has started since `epoch`. */
+  function engineOpCurrent(epoch: number): boolean {
+    return engineOpEpochRef.current === epoch;
+  }
 
   // Initial load: settings, then any queued context-menu action.
   useEffect(() => {
@@ -314,6 +340,14 @@ export default function App() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
+  // The model card renders at the end of the thread; when it appears mid-chat (a switch
+  // to a not-yet-downloaded model), bring it into view.
+  useEffect(() => {
+    if (!onboardingVisible) return;
+    const el = scrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [onboardingVisible]);
+
   useEffect(() => {
     applyTheme(settings.theme);
   }, [settings.theme]);
@@ -339,27 +373,43 @@ export default function App() {
   /** Free the model from memory by closing the offscreen document. */
   async function releaseModel() {
     cancelScheduledPreload();
+    const epoch = beginEngineOp();
     portRef.current?.disconnect();
     portRef.current = null;
     await releaseOffscreen();
-    setModelStatus('idle');
-    setPageNote('Model released — it will reload on your next question.');
+    if (engineOpCurrent(epoch)) {
+      setModelStatus('idle');
+      setPageNote('Model released — it will reload on your next question.');
+    }
+    endEngineOp(epoch);
   }
 
   /** Proactively (re)load the model so it's ready before the next message — but only when
    *  its weights are already on disk. Switching to a not-yet-downloaded model shows the
-   *  first-run card instead of silently starting a multi-GB download. */
+   *  first-run card instead of silently starting a multi-GB download. An explicit switch
+   *  supersedes a different model still mid-load: the newest choice wins, and a canceled
+   *  download resumes later from its cached shards. */
   async function preloadModel(s: Settings) {
     if (!webgpuAvailable() || abortRef.current) return;
+    const epoch = beginEngineOp();
     try {
       const port = await getWebllmPort();
-      setModelStatus('loading');
-      const loaded = await prewarmModel(port, s.webllmModel, contextForSettings(s), (p) => setLoadProgress(p));
-      setModelStatus(loaded ? 'ready' : 'needs-download');
+      if (engineOpCurrent(epoch)) setModelStatus('loading');
+      const loaded = await prewarmModel(
+        port,
+        s.webllmModel,
+        contextForSettings(s),
+        (p) => {
+          if (engineOpCurrent(epoch)) setLoadProgress(p);
+        },
+        { supersede: true },
+      );
+      if (engineOpCurrent(epoch)) setModelStatus(loaded ? 'ready' : 'needs-download');
     } catch {
-      setModelStatus('idle'); /* a real error surfaces on the next send */
+      if (engineOpCurrent(epoch)) setModelStatus('idle'); /* a real error surfaces on the next send */
     } finally {
-      setLoadProgress(null);
+      if (engineOpCurrent(epoch)) setLoadProgress(null);
+      endEngineOp(epoch);
     }
   }
 
@@ -367,20 +417,27 @@ export default function App() {
    *  the only two places a multi-GB download may start. */
   async function downloadModel() {
     const s = settingsRef.current;
+    const epoch = beginEngineOp();
     setOnboardError(null);
     try {
       if (!webgpuAvailable()) {
         throw new Error('This browser has no WebGPU. Use a recent Chromium browser (Chrome, Edge, or Brave).');
       }
       const port = await getWebllmPort();
-      setModelStatus('downloading');
-      await initModel(port, s.webllmModel, contextForSettings(s), (p) => setLoadProgress(p));
-      setModelStatus('ready');
+      if (engineOpCurrent(epoch)) setModelStatus('downloading');
+      await initModel(port, s.webllmModel, contextForSettings(s), (p) => {
+        if (engineOpCurrent(epoch)) setLoadProgress(p);
+      });
+      if (engineOpCurrent(epoch)) setModelStatus('ready');
     } catch (e) {
-      setModelStatus('needs-download');
-      setOnboardError(e instanceof Error ? e.message : String(e));
+      // A canceled or superseded load isn't a failure — whatever replaced it owns the UI.
+      if (engineOpCurrent(epoch) && !isLoadInterruption(e)) {
+        setModelStatus('needs-download');
+        setOnboardError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      setLoadProgress(null);
+      if (engineOpCurrent(epoch)) setLoadProgress(null);
+      endEngineOp(epoch);
     }
   }
 
@@ -404,7 +461,10 @@ export default function App() {
    *  Best-effort — errors are swallowed and nothing runs while a generation streams. */
   async function prewarm() {
     const s = settingsRef.current;
-    if (!webgpuAvailable() || abortRef.current) return;
+    // A background warm-up never contends with a generation or another engine operation
+    // (e.g. an explicit download): it must not steal their status or cancel their load.
+    if (!webgpuAvailable() || abortRef.current || engineOpRef.current !== null) return;
+    const epoch = beginEngineOp();
 
     // Page indexing is best-effort: capture fails on restricted pages (chrome://, stores,
     // or when no readable tab is active) and that must NOT stop the model from staging.
@@ -426,18 +486,21 @@ export default function App() {
           lastIndexedHashRef.current = hash;
         }
       }
-      if (abortRef.current) return;
+      if (abortRef.current || !engineOpCurrent(epoch)) return;
       // Stage the model eagerly when its weights are already on disk. A missing model is
       // never downloaded in the background — the first-run card (or an explicit question)
       // starts that, with consent and a visible size.
       setModelStatus((cur) => (cur === 'ready' ? cur : 'loading'));
-      const loaded = await prewarmModel(port, s.webllmModel, contextForSettings(s), (p) => setLoadProgress(p));
-      setModelStatus(loaded ? 'ready' : 'needs-download');
+      const loaded = await prewarmModel(port, s.webllmModel, contextForSettings(s), (p) => {
+        if (engineOpCurrent(epoch)) setLoadProgress(p);
+      });
+      if (engineOpCurrent(epoch)) setModelStatus(loaded ? 'ready' : 'needs-download');
     } catch {
       // A failed prewarm never demotes a model that is already resident.
-      setModelStatus((cur) => (cur === 'ready' ? cur : 'idle'));
+      if (engineOpCurrent(epoch)) setModelStatus((cur) => (cur === 'ready' ? cur : 'idle'));
     } finally {
-      setLoadProgress(null);
+      if (engineOpCurrent(epoch)) setLoadProgress(null);
+      endEngineOp(epoch);
     }
   }
 
@@ -495,8 +558,10 @@ export default function App() {
 
     const controller = new AbortController();
     abortRef.current = controller;
+    const epoch = beginEngineOp();
     setStreaming(true);
     let streamIterator: AsyncIterator<string> | null = null;
+    let modelReady = false;
 
     try {
       if (!webgpuAvailable()) {
@@ -535,8 +600,10 @@ export default function App() {
         const chunks = chunkPage(page);
         const hash = hashText(page.textContent);
         setPageNote('Indexing page for retrieval…');
-        await indexPage(port, page.url, hash, chunks, (p) => setLoadProgress(p));
-        setLoadProgress(null);
+        await indexPage(port, page.url, hash, chunks, (p) => {
+          if (engineOpCurrent(epoch)) setLoadProgress(p);
+        });
+        if (engineOpCurrent(epoch)) setLoadProgress(null);
         if (controller.signal.aborted) {
           setLastAssistant('_(stopped)_');
           return;
@@ -601,10 +668,23 @@ export default function App() {
       const useMapReduce = spec.supportsMapReduce && built.truncated;
 
       const port = await getWebllmPort();
-      setModelStatus((cur) => (cur === 'ready' ? cur : 'loading'));
-      await initModel(port, s.webllmModel, runtimeCtx, (p) => setLoadProgress(p));
-      setModelStatus('ready');
-      setLoadProgress(null);
+      if (engineOpCurrent(epoch)) setModelStatus((cur) => (cur === 'ready' ? cur : 'loading'));
+      // The abort signal makes Stop cancel the load itself — including a not-yet-downloaded
+      // model's download (it resumes later) — instead of silently waiting it out.
+      await initModel(
+        port,
+        s.webllmModel,
+        runtimeCtx,
+        (p) => {
+          if (engineOpCurrent(epoch)) setLoadProgress(p);
+        },
+        controller.signal,
+      );
+      modelReady = true;
+      if (engineOpCurrent(epoch)) {
+        setModelStatus('ready');
+        setLoadProgress(null);
+      }
       if (controller.signal.aborted) {
         setLastAssistant('_(stopped)_');
         return;
@@ -735,13 +815,18 @@ export default function App() {
           /* stream already closed */
         }
       }
-      const userStopped = e instanceof DOMException && e.name === 'AbortError';
+      // A load canceled by Stop or displaced by a model switch reads as "stopped", not a crash.
+      const userStopped = (e instanceof DOMException && e.name === 'AbortError') || isLoadInterruption(e);
       setLastAssistant(userStopped ? '_(stopped)_' : `⚠️ ${e instanceof Error ? e.message : String(e)}`);
+      // If the model never finished loading, its true state (cached? downloaded?) is
+      // unknown here — re-derive the status instead of leaving a stale "Loading…".
+      if (!modelReady) schedulePreload(settingsRef.current);
     } finally {
       setStreaming(false);
-      setLoadProgress(null);
+      if (engineOpCurrent(epoch)) setLoadProgress(null);
       setPageNote(null);
       abortRef.current = null;
+      endEngineOp(epoch);
     }
   }
 
@@ -783,9 +868,6 @@ export default function App() {
   }
 
   const disabled = streaming;
-  /** First-run card: no chat yet and the selected model's weights aren't on disk. */
-  const onboardingVisible =
-    messages.length === 0 && (modelStatus === 'needs-download' || modelStatus === 'downloading');
 
   return (
     <div className="flex h-full flex-col bg-zinc-100 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">
@@ -793,7 +875,7 @@ export default function App() {
       <header className="flex items-center gap-2 border-b border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-zinc-900">
         <Logo size={18} />
         <span className="text-sm font-semibold tracking-tight">Enclave</span>
-        {!onboardingVisible && modelStatus !== 'idle' && modelStatus !== 'needs-download' && (
+        {!onboardingVisible && modelStatus !== 'idle' && (
           <span
             className={
               modelStatus === 'ready'
@@ -839,7 +921,7 @@ export default function App() {
         </button>
       </header>
 
-      {/* Model download / load progress (the first-run card renders its own) */}
+      {/* Model load progress (the model card renders its own while it is visible) */}
       {loadProgress && !onboardingVisible && (
         <div className="border-b border-zinc-200 bg-zinc-100 px-3 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900">
           <p className="text-zinc-600 dark:text-zinc-300">Loading your model… {Math.round(loadProgress.progress * 100)}%</p>
@@ -865,17 +947,8 @@ export default function App() {
       {/* Chat thread */}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-3 py-3" onScroll={onChatScroll}>
         {messages.length === 0 &&
-          (onboardingVisible ? (
-            <OnboardingCard
-              settings={settings}
-              suggestedId={suggestedModelId}
-              busy={modelStatus === 'downloading'}
-              progress={loadProgress}
-              error={onboardError}
-              onSelect={(id) => void onSaveSettings({ webllmModel: id })}
-              onDownload={() => void downloadModel()}
-            />
-          ) : modelStatus === 'loading' ? (
+          !onboardingVisible &&
+          (modelStatus === 'loading' ? (
             <div className="mt-10 flex justify-center">
               <HexSpinner label="Loading your model…" />
             </div>
@@ -917,6 +990,17 @@ export default function App() {
             </div>
           );
         })}
+        {onboardingVisible && (
+          <OnboardingCard
+            settings={settings}
+            suggestedId={suggestedModelId}
+            busy={modelStatus === 'downloading'}
+            progress={loadProgress}
+            error={onboardError}
+            onSelect={(id) => void onSaveSettings({ webllmModel: id })}
+            onDownload={() => void downloadModel()}
+          />
+        )}
       </div>
 
       {/* Quick actions */}
