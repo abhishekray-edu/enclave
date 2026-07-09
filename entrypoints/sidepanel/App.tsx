@@ -266,6 +266,9 @@ export default function App() {
   const [modelStatus, setModelStatus] = useState<'idle' | 'needs-download' | 'downloading' | 'loading' | 'ready'>('idle');
   /** Error surfaced inside the first-run card (download failures). */
   const [onboardError, setOnboardError] = useState<string | null>(null);
+  /** Models whose download was interrupted (superseded by switching to another model) and
+   *  is resumable. Their fetched weight shards stay cached, so re-downloading resumes. */
+  const [pausedModels, setPausedModels] = useState<string[]>([]);
   const suggestedModelId = defaultModelForDevice();
   /** The model card is the one place downloads happen: it shows whenever the selected
    *  model's weights aren't on disk — on first run and mid-chat alike. */
@@ -282,8 +285,10 @@ export default function App() {
   // Refs keep submit() free of stale closures (settings load async; pending action auto-runs).
   const settingsRef = useRef(settings);
   const messagesRef = useRef(messages);
+  const modelStatusRef = useRef(modelStatus);
   settingsRef.current = settings;
   messagesRef.current = messages;
+  modelStatusRef.current = modelStatus;
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -354,6 +359,13 @@ export default function App() {
   useEffect(() => {
     applyTheme(settings.theme);
   }, [settings.theme]);
+
+  // The selected model is no longer "paused" once it's actively downloading again (resumed)
+  // or fully loaded — drop it from the paused list so the label clears.
+  useEffect(() => {
+    if (modelStatus !== 'downloading' && modelStatus !== 'ready') return;
+    setPausedModels((prev) => (prev.includes(settings.webllmModel) ? prev.filter((id) => id !== settings.webllmModel) : prev));
+  }, [modelStatus, settings.webllmModel]);
 
   useEffect(() => {
     return () => {
@@ -885,6 +897,17 @@ export default function App() {
 
   async function onSaveSettings(patch: Partial<Settings>) {
     const previous = settingsRef.current;
+    // Switching away from a model that is mid-download supersedes (pauses) that download —
+    // only one model can occupy the single GPU engine slot. Remember it as resumable so the
+    // UI can offer to pick up where it left off (its fetched shards stay cached).
+    if (
+      patch.webllmModel &&
+      patch.webllmModel !== previous.webllmModel &&
+      modelStatusRef.current === 'downloading'
+    ) {
+      const paused = previous.webllmModel;
+      setPausedModels((prev) => (prev.includes(paused) ? prev : [...prev, paused]));
+    }
     // Switching model clamps the context to that model's maximum.
     let next = patch;
     if (patch.webllmModel) {
@@ -897,6 +920,12 @@ export default function App() {
     const merged = await saveSettings(next);
     setSettings(merged);
     settingsRef.current = merged;
+    if (changedKeys.includes('webllmModel')) {
+      // Reset transient download UI at the switch so the card/badge never briefly shows the
+      // new model with the old model's progress. The debounced preload re-resolves the state.
+      setLoadProgress(null);
+      setModelStatus('loading');
+    }
     if (changedKeys.includes('webllmModel') || changedKeys.includes('webllmCtx')) schedulePreload(merged);
   }
 
@@ -945,7 +974,7 @@ export default function App() {
         >
           {WEBLLM_MODELS.map((m) => (
             <option key={m.id} value={m.id}>
-              {m.label} · ~{m.approxGb} GB
+              {m.label} · ~{m.approxGb} GB{pausedModels.includes(m.id) ? ' · download paused' : ''}
             </option>
           ))}
         </select>
@@ -1031,6 +1060,7 @@ export default function App() {
           <OnboardingCard
             settings={settings}
             suggestedId={suggestedModelId}
+            pausedModels={pausedModels}
             busy={modelStatus === 'downloading'}
             progress={loadProgress}
             error={onboardError}
@@ -1169,6 +1199,7 @@ function HexSpinner({ label }: { label: string }) {
 function OnboardingCard({
   settings,
   suggestedId,
+  pausedModels,
   busy,
   progress,
   error,
@@ -1177,6 +1208,7 @@ function OnboardingCard({
 }: {
   settings: Settings;
   suggestedId: string;
+  pausedModels: string[];
   busy: boolean;
   progress: LoadProgress | null;
   error: string | null;
@@ -1185,6 +1217,8 @@ function OnboardingCard({
 }) {
   const current = webllmModel(settings.webllmModel);
   const pct = Math.round((progress?.progress ?? 0) * 100);
+  // The selected model has a partial download to pick up where it left off.
+  const resumable = pausedModels.includes(settings.webllmModel);
   return (
     <div className="onboard mx-auto mt-4 max-w-[21rem] rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-700 dark:bg-zinc-800">
       <div className="flex flex-col items-center text-center">
@@ -1230,6 +1264,11 @@ function OnboardingCard({
                     Suggested
                   </span>
                 )}
+                {pausedModels.includes(m.id) && !selected && (
+                  <span className="shrink-0 rounded-full bg-amber-50 px-1.5 py-px text-[9px] font-medium text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
+                    Paused
+                  </span>
+                )}
               </span>
               <span className="shrink-0 text-[10px] tabular-nums text-zinc-400">~{m.approxGb} GB</span>
             </label>
@@ -1257,7 +1296,9 @@ function OnboardingCard({
           />
         )}
         <span className="relative">
-          {busy ? `Downloading… ${pct}%` : `Download ${current.label} · ~${current.approxGb} GB`}
+          {busy
+            ? `Downloading… ${pct}%`
+            : `${resumable ? 'Resume download' : 'Download'} ${current.label} · ~${current.approxGb} GB`}
         </span>
       </button>
 
