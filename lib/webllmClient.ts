@@ -41,9 +41,22 @@ export const WEBLLM_MODELS: WebllmModelOption[] = [
   { id: 'Qwen3-8B-q4f16_1-MLC', label: 'Qwen3 8B', approxGb: 5.7, maxCtx: 8192, safePromptTokens: 1536, note: 'Best, heaviest' },
 ];
 
+const DEFAULT_MODEL_ID = 'Qwen3-4B-q4f16_1-MLC';
+/** Lighter default suggested when the device reports limited memory. */
+const LOW_MEMORY_MODEL_ID = 'Llama-3.2-3B-Instruct-q4f16_1-MLC';
+
 /** Look up a model option by id (falls back to the default model). */
 export function webllmModel(id: string): WebllmModelOption {
-  return WEBLLM_MODELS.find((m) => m.id === id) ?? WEBLLM_MODELS[3];
+  return WEBLLM_MODELS.find((m) => m.id === id) ?? WEBLLM_MODELS.find((m) => m.id === DEFAULT_MODEL_ID)!;
+}
+
+/** Suggested model for this machine. navigator.deviceMemory is coarse (Chromium caps it at
+ *  8 and rounds down), so this only separates "8 GB+" machines from smaller ones — enough to
+ *  choose between a 2.3 GB and a 3.4 GB download as the starting point. Only consulted on a
+ *  fresh install; a stored model choice always wins. */
+export function defaultModelForDevice(): string {
+  const mem = (globalThis.navigator as (Navigator & { deviceMemory?: number }) | undefined)?.deviceMemory;
+  return mem != null && mem < 8 ? LOW_MEMORY_MODEL_ID : DEFAULT_MODEL_ID;
 }
 
 export const PORT_NAME = 'webllm';

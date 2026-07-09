@@ -114,12 +114,6 @@ export interface BuildOptions {
 
 export interface BuiltPrompt {
   messages: ChatMessage[];
-  /** Total characters of page text extracted. */
-  totalChars: number;
-  /** Characters of page text actually sent as the body. */
-  sentChars: number;
-  /** True when page extraction stopped early to stay responsive. */
-  sourceTruncated: boolean;
   /** True when the page did not fully fit and some content was dropped. */
   truncated: boolean;
   /** How the body was assembled: full/structure-aware text vs retrieved chunks. */
@@ -174,9 +168,6 @@ export function buildMessages(
   const system: ChatMessage = { role: 'system', content: systemBase + body };
   return {
     messages: [system, ...conversation],
-    totalChars: page.textContent.length,
-    sentChars: body.length,
-    sourceTruncated: Boolean(page.sourceTruncated),
     truncated,
     mode,
     usedChunks,

@@ -4,6 +4,7 @@ import { loadSettings, saveSettings } from '@/lib/settings';
 import {
   WEBLLM_MODELS,
   PORT_NAME,
+  defaultModelForDevice,
   webgpuAvailable,
   webllmModel,
   ensureOffscreen,
@@ -260,8 +261,11 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [pageNote, setPageNote] = useState<string | null>(null);
   const [loadProgress, setLoadProgress] = useState<LoadProgress | null>(null);
-  /** Model lifecycle shown in the header: downloading → loading → ready. */
-  const [modelStatus, setModelStatus] = useState<'idle' | 'downloading' | 'loading' | 'ready'>('idle');
+  /** Model lifecycle shown in the header: needs-download → downloading → loading → ready. */
+  const [modelStatus, setModelStatus] = useState<'idle' | 'needs-download' | 'downloading' | 'loading' | 'ready'>('idle');
+  /** Error surfaced inside the first-run card (download failures). */
+  const [onboardError, setOnboardError] = useState<string | null>(null);
+  const suggestedModelId = defaultModelForDevice();
 
   // Long-lived port to the offscreen document that hosts the in-browser engine.
   const portRef = useRef<WebllmPort | null>(null);
@@ -342,16 +346,39 @@ export default function App() {
     setPageNote('Model released — it will reload on your next question.');
   }
 
-  /** Proactively (re)load the model so it's ready before the next message. */
+  /** Proactively (re)load the model so it's ready before the next message — but only when
+   *  its weights are already on disk. Switching to a not-yet-downloaded model shows the
+   *  first-run card instead of silently starting a multi-GB download. */
   async function preloadModel(s: Settings) {
     if (!webgpuAvailable() || abortRef.current) return;
     try {
       const port = await getWebllmPort();
       setModelStatus('loading');
-      await initModel(port, s.webllmModel, contextForSettings(s), (p) => setLoadProgress(p));
-      setModelStatus('ready');
+      const loaded = await prewarmModel(port, s.webllmModel, contextForSettings(s), (p) => setLoadProgress(p));
+      setModelStatus(loaded ? 'ready' : 'needs-download');
     } catch {
       setModelStatus('idle'); /* a real error surfaces on the next send */
+    } finally {
+      setLoadProgress(null);
+    }
+  }
+
+  /** Explicit model download from the first-run card — this and a submitted question are
+   *  the only two places a multi-GB download may start. */
+  async function downloadModel() {
+    const s = settingsRef.current;
+    setOnboardError(null);
+    try {
+      if (!webgpuAvailable()) {
+        throw new Error('This browser has no WebGPU. Use a recent Chromium browser (Chrome, Edge, or Brave).');
+      }
+      const port = await getWebllmPort();
+      setModelStatus('downloading');
+      await initModel(port, s.webllmModel, contextForSettings(s), (p) => setLoadProgress(p));
+      setModelStatus('ready');
+    } catch (e) {
+      setModelStatus('needs-download');
+      setOnboardError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoadProgress(null);
     }
@@ -400,15 +427,12 @@ export default function App() {
         }
       }
       if (abortRef.current) return;
-      // Stage the model eagerly: load from disk if cached, otherwise download it now so the
-      // first chat never pays for it. The header badge tracks which phase we're in.
+      // Stage the model eagerly when its weights are already on disk. A missing model is
+      // never downloaded in the background — the first-run card (or an explicit question)
+      // starts that, with consent and a visible size.
       setModelStatus((cur) => (cur === 'ready' ? cur : 'loading'));
       const loaded = await prewarmModel(port, s.webllmModel, contextForSettings(s), (p) => setLoadProgress(p));
-      if (!loaded) {
-        setModelStatus('downloading');
-        await initModel(port, s.webllmModel, contextForSettings(s), (p) => setLoadProgress(p));
-      }
-      setModelStatus('ready');
+      setModelStatus(loaded ? 'ready' : 'needs-download');
     } catch {
       // A failed prewarm never demotes a model that is already resident.
       setModelStatus((cur) => (cur === 'ready' ? cur : 'idle'));
@@ -478,7 +502,7 @@ export default function App() {
       if (!webgpuAvailable()) {
         throw new Error('This browser has no WebGPU. Use a recent Chromium browser (Chrome, Edge, or Brave).');
       }
-      setPageNote('Reading page...');
+      setPageNote('Reading page…');
       const page = await withTimeout(
         capturePage(s.viewportBoost),
         PAGE_CAPTURE_TIMEOUT_MS,
@@ -491,7 +515,7 @@ export default function App() {
       if (opts?.selectionOverride && !page.selection.trim()) {
         page.selection = opts.selectionOverride;
       }
-      setPageNote('Preparing page context...');
+      setPageNote('Preparing page context…');
       const runtimeCtx = contextForSettings(s);
       const model = webllmModel(s.webllmModel);
       const budget = pageBudgetTokens(s, page, conversation, runtimeCtx, spec.systemPrompt || undefined);
@@ -499,7 +523,6 @@ export default function App() {
       // Big models get SMALLER prompts — one oversized prefill on an integrated GPU can starve
       // the OS compositor and take down the whole session (see docs/large-page-handling.md).
       const bodyBudget = Math.min(budget, model.safePromptTokens);
-      const words = Math.max(1, Math.round(page.textContent.length / 6));
       const sysOverride = spec.systemPrompt || undefined;
       // Retrieve from (rather than truncate) the page whenever the task allows it and the page
       // overflows what this model can safely take in one prompt. A selection no longer disables
@@ -512,7 +535,7 @@ export default function App() {
         const chunks = chunkPage(page);
         const hash = hashText(page.textContent);
         setPageNote('Indexing page for retrieval…');
-        const { fromCache } = await indexPage(port, page.url, hash, chunks, (p) => setLoadProgress(p));
+        await indexPage(port, page.url, hash, chunks, (p) => setLoadProgress(p));
         setLoadProgress(null);
         if (controller.signal.aborted) {
           setLastAssistant('_(stopped)_');
@@ -564,26 +587,14 @@ export default function App() {
           systemPromptOverride: sysOverride,
           maxBodyTokens: model.safePromptTokens,
         });
-        setPageNote(
-          `Answering from the ${results.length} most relevant section${results.length === 1 ? '' : 's'} of this ~${words.toLocaleString()}-word page${fromCache ? '' : ' (indexed just now)'}.`,
-        );
+        setPageNote(null);
       } else {
         built = buildMessages(s, page, conversation, runtimeCtx, {
           systemPromptOverride: sysOverride,
           maxBodyTokens: model.safePromptTokens,
         });
-        if (spec.supportsMapReduce && built.truncated) {
-          setPageNote('Preparing to summarize a long page…');
-        } else if (built.truncated) {
-          const pct = built.totalChars ? Math.round((built.sentChars / built.totalChars) * 100) : 0;
-          setPageNote(
-            `⚠ Long page (~${words.toLocaleString()} words): sent the first ${pct}% as complete sections. Ask a question to search the whole page.`,
-          );
-        } else if (built.sourceTruncated) {
-          setPageNote(`⚠ Very large page: read a bounded slice (~${words.toLocaleString()} words) so the extension stays responsive.`);
-        } else {
-          setPageNote(`Read the full page (~${words.toLocaleString()} words).`);
-        }
+        // Coverage is never narrated — the note strip only speaks while work is in flight.
+        setPageNote(spec.supportsMapReduce && built.truncated ? 'Preparing to summarize a long page…' : null);
       }
 
       // A large page under the summarize task is handled by map-reduce, not truncation.
@@ -656,7 +667,6 @@ export default function App() {
           },
         );
         setLastAssistant(summary || (controller.signal.aborted ? '_(stopped)_' : '_(no response)_'));
-        setPageNote(`Summarized this ~${words.toLocaleString()}-word page in ${chunks.length} sections.`);
       } else if (spec.outputMode === 'json') {
         // Structured extraction: one non-streaming call, parse, store as a structured message.
         let raw: string;
@@ -730,6 +740,7 @@ export default function App() {
     } finally {
       setStreaming(false);
       setLoadProgress(null);
+      setPageNote(null);
       abortRef.current = null;
     }
   }
@@ -772,6 +783,9 @@ export default function App() {
   }
 
   const disabled = streaming;
+  /** First-run card: no chat yet and the selected model's weights aren't on disk. */
+  const onboardingVisible =
+    messages.length === 0 && (modelStatus === 'needs-download' || modelStatus === 'downloading');
 
   return (
     <div className="flex h-full flex-col bg-zinc-100 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100">
@@ -779,7 +793,7 @@ export default function App() {
       <header className="flex items-center gap-2 border-b border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-zinc-900">
         <Logo size={18} />
         <span className="text-sm font-semibold tracking-tight">Enclave</span>
-        {modelStatus !== 'idle' && (
+        {!onboardingVisible && modelStatus !== 'idle' && modelStatus !== 'needs-download' && (
           <span
             className={
               modelStatus === 'ready'
@@ -789,19 +803,19 @@ export default function App() {
             title={
               modelStatus === 'ready'
                 ? 'Model is loaded on the GPU — answers start immediately.'
-                : modelStatus === 'downloading'
-                  ? 'First-time download of this model; it is cached afterwards.'
-                  : 'Loading model weights onto the GPU.'
+                : 'Loading the model onto your GPU.'
             }
           >
-            <span
-              className={
-                modelStatus === 'ready'
-                  ? 'h-1.5 w-1.5 rounded-full bg-emerald-500'
-                  : 'h-1.5 w-1.5 animate-pulse rounded-full bg-zinc-400'
-              }
-            />
-            {modelStatus === 'ready' ? 'Ready to chat' : modelStatus === 'downloading' ? 'Downloading model…' : 'Loading model…'}
+            <svg
+              width={8}
+              height={8}
+              viewBox="0 0 128 128"
+              aria-hidden="true"
+              className={modelStatus === 'ready' ? 'text-emerald-500' : 'animate-pulse text-zinc-400'}
+            >
+              <polygon points={HEX_POINTS} fill="currentColor" />
+            </svg>
+            {modelStatus === 'ready' ? 'Ready to chat' : 'Loading…'}
           </span>
         )}
         <select
@@ -825,43 +839,51 @@ export default function App() {
         </button>
       </header>
 
-      {/* Model download / load progress */}
-      {loadProgress && (
+      {/* Model download / load progress (the first-run card renders its own) */}
+      {loadProgress && !onboardingVisible && (
         <div className="border-b border-zinc-200 bg-zinc-100 px-3 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-900">
-          <p className="text-zinc-600 dark:text-zinc-300">Loading model… {Math.round(loadProgress.progress * 100)}%</p>
+          <p className="text-zinc-600 dark:text-zinc-300">Loading your model… {Math.round(loadProgress.progress * 100)}%</p>
           <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-zinc-300 dark:bg-zinc-700">
             <div
               className="h-full bg-zinc-600 transition-all dark:bg-zinc-300"
               style={{ width: `${Math.round(loadProgress.progress * 100)}%` }}
             />
           </div>
-          <p className="mt-1 truncate text-[10px] text-zinc-400">{loadProgress.text}</p>
         </div>
       )}
 
       {/* Settings panel */}
       {showSettings && <SettingsPanel settings={settings} onSave={onSaveSettings} onRelease={releaseModel} busy={streaming} />}
 
-      {/* Page coverage note */}
+      {/* Transient work-in-progress note (cleared whenever nothing is running) */}
       {pageNote && (
-        <div
-          className={
-            pageNote.startsWith('⚠')
-              ? 'border-b border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-800 dark:border-amber-800/60 dark:bg-amber-950/40 dark:text-amber-300'
-              : 'border-b border-zinc-200 bg-zinc-100 px-3 py-1.5 text-[11px] text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400'
-          }
-        >
+        <div className="border-b border-zinc-200 bg-zinc-100 px-3 py-1.5 text-[11px] text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
           {pageNote}
         </div>
       )}
 
       {/* Chat thread */}
       <div ref={scrollRef} className="flex-1 space-y-3 overflow-y-auto px-3 py-3" onScroll={onChatScroll}>
-        {messages.length === 0 && (
-          <div className="mt-6 text-center text-xs text-zinc-400 dark:text-zinc-500">
-            Ask anything about the current page. Everything runs locally on your device.
-          </div>
-        )}
+        {messages.length === 0 &&
+          (onboardingVisible ? (
+            <OnboardingCard
+              settings={settings}
+              suggestedId={suggestedModelId}
+              busy={modelStatus === 'downloading'}
+              progress={loadProgress}
+              error={onboardError}
+              onSelect={(id) => void onSaveSettings({ webllmModel: id })}
+              onDownload={() => void downloadModel()}
+            />
+          ) : modelStatus === 'loading' ? (
+            <div className="mt-10 flex justify-center">
+              <HexSpinner label="Loading your model…" />
+            </div>
+          ) : (
+            <div className="mt-6 text-center text-xs text-zinc-400 dark:text-zinc-500">
+              Ask anything about the current page. Everything runs locally on your device.
+            </div>
+          ))}
         {messages.map((m, i) => {
           const isUser = m.role === 'user';
           const isPlaceholder = !m.content && streaming && i === messages.length - 1;
@@ -964,6 +986,165 @@ export default function App() {
           </button>
         )}
       </div>
+    </div>
+  );
+}
+
+/** Geometry shared by the animated logo states (matches Logo.tsx / public/logo.svg). */
+const HEX_POINTS = '64,8 114,36 114,92 64,120 14,92 14,36';
+const SPARK_PATH =
+  'M64 36 C65.5 50 78 62.5 92 64 C78 65.5 65.5 78 64 92 C62.5 78 50 65.5 36 64 C50 62.5 62.5 50 64 36 Z';
+
+/** The Enclave hexagon, stroke-drawn once when the first-run card mounts ("sealing the
+ *  enclave"), with the spark fading in after. Static under prefers-reduced-motion. */
+function HexDraw() {
+  return (
+    <svg width={44} height={44} viewBox="0 0 128 128" fill="none" aria-hidden="true">
+      <polygon
+        className="onboard-hex text-zinc-400 dark:text-zinc-500"
+        points={HEX_POINTS}
+        pathLength={1}
+        stroke="currentColor"
+        strokeWidth="6"
+        strokeLinejoin="round"
+      />
+      <path className="onboard-spark text-zinc-800 dark:text-zinc-200" d={SPARK_PATH} fill="currentColor" />
+    </svg>
+  );
+}
+
+/** Enclave-branded loader: a dash orbits the hexagon while the spark breathes. Shown while
+ *  model weights load from the local cache onto the GPU. Static under prefers-reduced-motion. */
+function HexSpinner({ label }: { label: string }) {
+  return (
+    <div className="flex flex-col items-center gap-2" role="status" aria-label={label}>
+      <svg width={40} height={40} viewBox="0 0 128 128" fill="none" aria-hidden="true">
+        <polygon
+          className="text-zinc-200 dark:text-zinc-700"
+          points={HEX_POINTS}
+          stroke="currentColor"
+          strokeWidth="6"
+          strokeLinejoin="round"
+        />
+        <polygon
+          className="hex-spinner-dash text-zinc-700 dark:text-zinc-300"
+          points={HEX_POINTS}
+          pathLength={1}
+          stroke="currentColor"
+          strokeWidth="6"
+          strokeLinejoin="round"
+          strokeLinecap="round"
+        />
+        <path className="hex-spinner-spark text-zinc-800 dark:text-zinc-200" d={SPARK_PATH} fill="currentColor" />
+      </svg>
+      <span className="text-[11px] text-zinc-400 dark:text-zinc-500">{label}</span>
+    </div>
+  );
+}
+
+/** First-run setup: pick a model (one row is suggested from the device's reported memory)
+ *  and download it explicitly — nothing downloads until the button or a question says so. */
+function OnboardingCard({
+  settings,
+  suggestedId,
+  busy,
+  progress,
+  error,
+  onSelect,
+  onDownload,
+}: {
+  settings: Settings;
+  suggestedId: string;
+  busy: boolean;
+  progress: LoadProgress | null;
+  error: string | null;
+  onSelect: (id: string) => void;
+  onDownload: () => void;
+}) {
+  const current = webllmModel(settings.webllmModel);
+  const pct = Math.round((progress?.progress ?? 0) * 100);
+  return (
+    <div className="onboard mx-auto mt-4 max-w-[21rem] rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-700 dark:bg-zinc-800">
+      <div className="flex flex-col items-center text-center">
+        <HexDraw />
+        <h2 className="mt-2 text-sm font-semibold tracking-tight">Pick your model</h2>
+      </div>
+
+      <fieldset className="mt-3 space-y-1.5" disabled={busy}>
+        <legend className="sr-only">Model</legend>
+        {WEBLLM_MODELS.map((m) => {
+          const selected = m.id === settings.webllmModel;
+          return (
+            <label
+              key={m.id}
+              className={
+                'flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-1.5 transition-colors ' +
+                (selected
+                  ? 'border-zinc-800 bg-zinc-50 dark:border-zinc-300 dark:bg-zinc-900/40'
+                  : 'border-zinc-200 hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-700/40')
+              }
+            >
+              <input
+                type="radio"
+                name="onboard-model"
+                className="peer sr-only"
+                checked={selected}
+                onChange={() => onSelect(m.id)}
+              />
+              <span
+                aria-hidden="true"
+                className={
+                  'h-3 w-3 shrink-0 rounded-full border-2 peer-focus-visible:ring-2 peer-focus-visible:ring-zinc-400 ' +
+                  (selected
+                    ? 'border-zinc-800 bg-zinc-800 dark:border-zinc-200 dark:bg-zinc-200'
+                    : 'border-zinc-300 dark:border-zinc-600')
+                }
+              />
+              <span className="flex min-w-0 flex-1 items-baseline gap-1.5 text-xs">
+                <span className="font-medium">{m.label}</span>
+                <span className="truncate text-[10px] text-zinc-400">{m.note}</span>
+                {m.id === suggestedId && (
+                  <span className="shrink-0 rounded-full bg-emerald-50 px-1.5 py-px text-[9px] font-medium text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300">
+                    Suggested
+                  </span>
+                )}
+              </span>
+              <span className="shrink-0 text-[10px] tabular-nums text-zinc-400">~{m.approxGb} GB</span>
+            </label>
+          );
+        })}
+      </fieldset>
+
+      <button
+        onClick={onDownload}
+        disabled={busy}
+        className={
+          'relative mt-3 w-full overflow-hidden rounded-lg px-3 py-2 text-sm font-medium ' +
+          (busy
+            ? 'cursor-default bg-zinc-100 text-zinc-800 dark:bg-zinc-700 dark:text-zinc-100'
+            : 'bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-300')
+        }
+      >
+        {/* The button is the progress bar: an emerald fill sweeps it left to right — the
+            same green as the "Ready to chat" badge it resolves into. */}
+        {busy && (
+          <span
+            aria-hidden="true"
+            className="absolute inset-y-0 left-0 bg-emerald-100 transition-[width] duration-300 dark:bg-emerald-800"
+            style={{ width: `${pct}%` }}
+          />
+        )}
+        <span className="relative">
+          {busy ? `Downloading… ${pct}%` : `Download ${current.label} · ~${current.approxGb} GB`}
+        </span>
+      </button>
+
+      {error && !busy && (
+        <p className="mt-1.5 text-center text-[11px] text-amber-700 dark:text-amber-400">{error}</p>
+      )}
+      <p className="mt-2 text-center text-[11px] text-zinc-500 dark:text-zinc-400">
+        Download once. Run on your GPU. Forever free.
+      </p>
     </div>
   );
 }

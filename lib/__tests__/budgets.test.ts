@@ -2,11 +2,11 @@
 // monopolized the integrated GPU past macOS's 40s WindowServer watchdog and killed the whole
 // login session. These tests pin the invariant that NO path can build a prompt bigger than
 // the per-model safePromptTokens cap, for a 6,000-word page, on every model in the catalog.
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { buildMessages, estimateTokens, pageBudgetTokens } from '../prompt';
 import { chunkPage } from '../chunking';
 import { summarizeChunks } from '../summarize';
-import { WEBLLM_MODELS } from '../webllmClient';
+import { WEBLLM_MODELS, defaultModelForDevice, webllmModel } from '../webllmClient';
 import { DEFAULT_SETTINGS, MAX_CONTEXT_TOKENS, type ChatMessage, type PageBlock, type PageContent, type RetrievedChunk } from '../types';
 
 /** ~6,000-word page (≈36k chars ≈ 9k tokens) with headings, like a long article. */
@@ -50,6 +50,25 @@ describe('model catalog safety invariants', () => {
       expect(m.safePromptTokens, m.id).toBeLessThanOrEqual(1536);
       expect(m.maxCtx, m.id).toBeLessThanOrEqual(8192);
     }
+  });
+});
+
+describe('defaultModelForDevice', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('suggests a lighter catalog model below 8 GB and the recommended one otherwise', () => {
+    vi.stubGlobal('navigator', { deviceMemory: 4 });
+    const low = defaultModelForDevice();
+    vi.stubGlobal('navigator', { deviceMemory: 8 });
+    const high = defaultModelForDevice();
+    vi.stubGlobal('navigator', undefined);
+    const unknown = defaultModelForDevice();
+
+    const ids = WEBLLM_MODELS.map((m) => m.id);
+    expect(ids).toContain(low);
+    expect(ids).toContain(high);
+    expect(unknown).toBe(high); // unknown memory never downgrades the default
+    expect(webllmModel(low).approxGb).toBeLessThan(webllmModel(high).approxGb);
   });
 });
 

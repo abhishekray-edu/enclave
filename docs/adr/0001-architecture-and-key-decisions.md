@@ -46,8 +46,11 @@ follow-up questions are instant.
 - **Lifecycle:** the background worker creates the offscreen document on demand. Changing the
   model or context window reloads the engine automatically (debounced), and the panel prewarms
   on open and tab switch (indexing the page, and loading the model only if its weights are
-  already cached — a prewarm never triggers a multi-GB download). A **"Release model from
-  memory"** control closes the document to reclaim RAM/VRAM; it reloads on the next question.
+  already cached — a prewarm never triggers a multi-GB download). On a fresh install the panel
+  shows a first-run model picker instead (the default is suggested from the device's reported
+  memory) and downloads only on explicit confirmation — or when the user just asks a question.
+  A **"Release model from memory"** control closes the document to reclaim RAM/VRAM; it
+  reloads on the next question.
 - **Bundle split:** the heavy WebLLM and Transformers.js runtimes are imported only by the
   offscreen bundles, so the side-panel bundle stays small (~0.5 MB).
 

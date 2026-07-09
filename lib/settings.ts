@@ -1,5 +1,6 @@
 import { browser } from 'wxt/browser';
 import { DEFAULT_SETTINGS, MAX_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, type Settings } from './types';
+import { defaultModelForDevice } from './webllmClient';
 
 const KEY = 'settings';
 
@@ -16,10 +17,13 @@ function normalizeSettings(settings: Settings): Settings {
   };
 }
 
-/** Load settings, filling any missing fields with defaults. */
+/** Load settings, filling any missing fields with defaults. On a fresh install (nothing
+ *  stored yet) the default model is suggested from the device's reported memory. */
 export async function loadSettings(): Promise<Settings> {
   const stored = await browser.storage.local.get(KEY);
-  return normalizeSettings({ ...DEFAULT_SETTINGS, ...(stored[KEY] as Partial<Settings> | undefined) });
+  const patch = stored[KEY] as Partial<Settings> | undefined;
+  const defaults = patch ? DEFAULT_SETTINGS : { ...DEFAULT_SETTINGS, webllmModel: defaultModelForDevice() };
+  return normalizeSettings({ ...defaults, ...patch });
 }
 
 /** Persist a partial settings patch and return the merged result. */

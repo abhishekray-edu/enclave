@@ -39,8 +39,9 @@ It's a Chrome **side-panel** extension: open it beside any tab and chat about wh
 - **Structured extraction** — pull article metadata, key facts, or contacts as JSON, with
   schema-constrained decoding (valid JSON by construction).
 - **Quick actions** — Ask, Summarize, Explain a selection (also via right-click), Extract.
-- **Fast when it matters** — the page is indexed and the model staged as soon as the panel
-  opens, and the model stays resident across panel open/close for instant follow-ups.
+- **Fast when it matters** — the page is indexed and any already-downloaded model staged as
+  soon as the panel opens, and the model stays resident across panel open/close for instant
+  follow-ups. Downloads only ever start when you ask for them.
 - **Clean answers** — Markdown with syntax-highlighted, copyable code blocks, in a neutral
   light/dark theme that follows your system.
 
@@ -83,7 +84,8 @@ Grab the latest packaged build from the
 2. Go to `chrome://extensions` and enable **Developer mode** (top right).
 3. **Load unpacked** → select the unzipped folder.
 4. Click the Enclave icon (or press **⌘⇧L** / **Ctrl+Shift+L**) to open the side panel.
-5. Ask a question. The first time, the model downloads with a progress bar; after that it's cached.
+5. Pick a model when the panel opens — Enclave suggests one for your machine — and download
+   it once; after that it's cached, and you can switch models anytime.
 
 > Firefox users: download `enclave-<version>-firefox.zip` instead and load it via
 > `about:debugging` → **This Firefox** → **Load Temporary Add-on**.
