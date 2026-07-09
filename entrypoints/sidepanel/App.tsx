@@ -904,31 +904,6 @@ export default function App() {
       <header className="flex items-center gap-2 border-b border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-zinc-900">
         <Logo size={18} />
         <span className="text-sm font-semibold tracking-tight">Enclave</span>
-        {!onboardingVisible && modelStatus !== 'idle' && (
-          <span
-            className={
-              modelStatus === 'ready'
-                ? 'flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300'
-                : 'flex items-center gap-1 rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] font-medium text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400'
-            }
-            title={
-              modelStatus === 'ready'
-                ? 'Model is loaded on the GPU — answers start immediately.'
-                : 'Loading the model onto your GPU.'
-            }
-          >
-            <svg
-              width={8}
-              height={8}
-              viewBox="0 0 128 128"
-              aria-hidden="true"
-              className={modelStatus === 'ready' ? 'text-emerald-500' : 'animate-pulse text-zinc-400'}
-            >
-              <polygon points={HEX_POINTS} fill="currentColor" />
-            </svg>
-            {modelStatus === 'ready' ? 'Ready to chat' : 'Loading…'}
-          </span>
-        )}
         <select
           className="ml-auto max-w-[12rem] truncate rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100"
           value={settings.webllmModel}
