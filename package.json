@@ -1,11 +1,27 @@
 {
   "name": "enclave",
   "description": "Run LLMs locally in your browser, on your own GPU — a private page assistant. Nothing ever leaves your machine.",
+  "author": "Abhishek Ray",
   "license": "MIT",
   "homepage": "https://github.com/abhishekray-edu/enclave",
   "repository": {
     "type": "git",
     "url": "https://github.com/abhishekray-edu/enclave.git"
+  },
+  "bugs": {
+    "url": "https://github.com/abhishekray-edu/enclave/issues"
+  },
+  "keywords": [
+    "chrome-extension",
+    "webgpu",
+    "webllm",
+    "local-llm",
+    "privacy",
+    "side-panel",
+    "rag"
+  ],
+  "engines": {
+    "node": ">=20"
   },
   "private": true,
   "version": "0.1.0",
@@ -27,8 +43,8 @@
     "@huggingface/transformers": "^4.2.0",
     "@mlc-ai/web-llm": "^0.2.84",
     "@mozilla/readability": "^0.6.0",
-    "dompurify": "^3.4.11",
     "highlight.js": "^11.11.1",
+    "js-tiktoken": "^1.0.21",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
     "react-markdown": "^10.1.0",
