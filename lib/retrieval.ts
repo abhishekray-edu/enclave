@@ -1,7 +1,7 @@
-// In-browser retrieval: embeds page chunks with a tiny Transformers.js model on the
-// CPU/WASM backend (kept OFF the WebGPU/VRAM critical path the LLM needs), caches vectors
-// in IndexedDB, and does brute-force cosine top-k. OFFSCREEN-ONLY: importing this pulls in
-// @huggingface/transformers, so it must never be imported by the side panel bundle.
+// In-browser retrieval: embeds page chunks with a tiny Transformers.js model (WebGPU when
+// available — at ~22M params its VRAM cost is negligible next to the LLM — else CPU/WASM),
+// caches vectors in IndexedDB, and does brute-force cosine top-k. OFFSCREEN-ONLY: importing
+// this pulls in @huggingface/transformers, so it must never be imported by the side panel bundle.
 import { pipeline, type FeatureExtractionPipeline } from '@huggingface/transformers';
 import { configureOrtRuntime } from './ortEnv';
 import type { Chunk, RetrievedChunk } from './types';

@@ -115,14 +115,11 @@ export function chunkPage(page: PageContent, opts?: ChunkOptions): Chunk[] {
     buf = '';
     if (!core) return;
     const text = prevTail ? `${prevTail}\n${core}` : core;
-    const idx = page.textContent.indexOf(core.slice(0, 80));
     chunks.push({
       ordinal: ordinal++,
       text,
       heading: bufHeading,
       tokensEstimate: estimateTokens(text),
-      start: idx >= 0 ? idx : undefined,
-      end: idx >= 0 ? idx + core.length : undefined,
     });
     prevTail = tailTokens(core, overlapTokens);
     bufHeading = undefined;

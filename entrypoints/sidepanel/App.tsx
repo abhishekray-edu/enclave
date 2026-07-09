@@ -32,9 +32,11 @@ import {
   MAX_CONTEXT_TOKENS,
   MIN_CONTEXT_TOKENS,
   type ChatMessage,
+  type GetPageContentRequest,
   type MessageSource,
   type PageContent,
   type PendingAction,
+  type ScrollToTextRequest,
   type Settings,
   type Theme,
 } from '@/lib/types';
@@ -76,7 +78,10 @@ async function capturePage(wantViewport = false): Promise<PageContent> {
   if (!tab?.id) throw new Error('No active tab.');
   const tabId = tab.id;
   const ask = () =>
-    browser.tabs.sendMessage(tabId, { type: 'GET_PAGE_CONTENT', wantViewport }) as Promise<PageContent>;
+    browser.tabs.sendMessage(tabId, {
+      type: 'GET_PAGE_CONTENT',
+      wantViewport,
+    } satisfies GetPageContentRequest) as Promise<PageContent>;
 
   try {
     return await ask();
@@ -97,7 +102,7 @@ async function capturePage(wantViewport = false): Promise<PageContent> {
 async function jumpToSource(text: string) {
   try {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) await browser.tabs.sendMessage(tab.id, { type: 'SCROLL_TO_TEXT', text });
+    if (tab?.id) await browser.tabs.sendMessage(tab.id, { type: 'SCROLL_TO_TEXT', text } satisfies ScrollToTextRequest);
   } catch {
     /* content script not reachable on this tab */
   }
@@ -477,7 +482,7 @@ export default function App() {
       const page = await withTimeout(
         capturePage(s.viewportBoost),
         PAGE_CAPTURE_TIMEOUT_MS,
-        'This page took too long to read. LinkedIn pages can be heavy; select the relevant text and try again.',
+        'This page took too long to read. Heavy, app-like pages can do this — select the relevant text and try again.',
       );
       if (controller.signal.aborted) {
         setLastAssistant('_(stopped)_');
@@ -703,7 +708,6 @@ export default function App() {
               heading: c.heading,
               snippet: c.text.replace(/\s+/g, ' ').trim().slice(0, 140),
               score: c.score,
-              ordinal: c.ordinal,
             }));
           setMessages((prev) => {
             const copy = [...prev];

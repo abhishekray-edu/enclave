@@ -35,9 +35,6 @@ export interface Chunk {
   /** Nearest preceding heading, for provenance and prompt labeling. */
   heading?: string;
   tokensEstimate: number;
-  /** Char offsets into PageContent.textContent (enables scroll-to-source). */
-  start?: number;
-  end?: number;
 }
 
 /** A chunk returned by retrieval, scored against a query (cosine, 0..1). */
@@ -50,7 +47,6 @@ export interface MessageSource {
   heading?: string;
   snippet: string;
   score: number;
-  ordinal: number;
 }
 
 export type ChatRole = 'user' | 'assistant' | 'system';
@@ -93,7 +89,7 @@ export interface Settings {
 }
 
 export const SYSTEM_PROMPT =
-  'You are a helpful assistant embedded in a web browser. Answer the user based the content of the web page provided in the context. Be concise and accurate.';
+  'You are a helpful assistant embedded in a web browser. Answer the user based on the content of the web page provided in the context. Be concise and accurate.';
 
 export const DEFAULT_SETTINGS: Settings = {
   theme: 'system',
@@ -110,6 +106,14 @@ export const DEFAULT_SETTINGS: Settings = {
 /** Sent by the side panel to a tab's content script to capture the page. */
 export interface GetPageContentRequest {
   type: 'GET_PAGE_CONTENT';
+  /** Also collect the text currently visible in the viewport (viewport-aware ranking). */
+  wantViewport?: boolean;
+}
+
+/** Ask the content script to scroll a source snippet into view and highlight it. */
+export interface ScrollToTextRequest {
+  type: 'SCROLL_TO_TEXT';
+  text: string;
 }
 
 /** A quick action queued by the background worker (e.g. from the context menu). */

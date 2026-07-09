@@ -1,5 +1,5 @@
 import { Readability, isProbablyReaderable } from '@mozilla/readability';
-import type { PageBlock, PageContent } from '@/lib/types';
+import type { GetPageContentRequest, PageBlock, PageContent, ScrollToTextRequest } from '@/lib/types';
 
 const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'SVG', 'CANVAS', 'AUDIO', 'VIDEO']);
 const BLOCK_TAGS = new Set([
@@ -263,10 +263,11 @@ export default defineContentScript({
   matches: ['<all_urls>'],
   main() {
     browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-      if (message?.type === 'GET_PAGE_CONTENT') {
-        sendResponse(extractPage(Boolean(message.wantViewport)));
-      } else if (message?.type === 'SCROLL_TO_TEXT') {
-        sendResponse({ ok: scrollToText(String(message.text ?? '')) });
+      const msg = message as GetPageContentRequest | ScrollToTextRequest | undefined;
+      if (msg?.type === 'GET_PAGE_CONTENT') {
+        sendResponse(extractPage(Boolean(msg.wantViewport)));
+      } else if (msg?.type === 'SCROLL_TO_TEXT') {
+        sendResponse({ ok: scrollToText(String(msg.text ?? '')) });
       }
     });
   },
