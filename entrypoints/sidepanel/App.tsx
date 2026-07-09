@@ -42,6 +42,9 @@ import {
 } from '@/lib/types';
 
 const PENDING_KEY = 'pendingAction';
+/** Persists which models have an interrupted (resumable) download, so the paused state
+ *  survives the panel being recreated on close/reopen. */
+const PAUSED_MODELS_KEY = 'pausedDownloads';
 const PAGE_CAPTURE_TIMEOUT_MS = 8_000;
 const FIRST_TOKEN_TIMEOUT_MS = 90_000;
 const NEXT_TOKEN_TIMEOUT_MS = 45_000;
@@ -249,10 +252,11 @@ export default function App() {
   // Refs keep submit() free of stale closures (settings load async; pending action auto-runs).
   const settingsRef = useRef(settings);
   const messagesRef = useRef(messages);
-  const modelStatusRef = useRef(modelStatus);
   settingsRef.current = settings;
   messagesRef.current = messages;
-  modelStatusRef.current = modelStatus;
+  // Gate persisting paused models until the stored value has been loaded, so the initial
+  // empty state never overwrites what's on disk.
+  const pausedHydratedRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
@@ -285,6 +289,15 @@ export default function App() {
       const s = await loadSettings();
       setSettings(s);
       settingsRef.current = s;
+
+      // Rehydrate paused (interrupted) downloads before anything can persist over them, so a
+      // partially-downloaded model still reads as "download paused" after a close/reopen.
+      const pausedStored = await browser.storage.local.get(PAUSED_MODELS_KEY);
+      const paused = pausedStored[PAUSED_MODELS_KEY];
+      if (Array.isArray(paused)) {
+        setPausedModels(paused.filter((id): id is string => typeof id === 'string'));
+      }
+      pausedHydratedRef.current = true;
 
       const stored = await browser.storage.local.get(PENDING_KEY);
       const pending = stored[PENDING_KEY] as PendingAction | undefined;
@@ -324,12 +337,24 @@ export default function App() {
     applyTheme(settings.theme);
   }, [settings.theme]);
 
-  // The selected model is no longer "paused" once it's actively downloading again (resumed)
-  // or fully loaded — drop it from the paused list so the label clears.
+  // A model has a resumable (incomplete) download from the moment its download starts until it
+  // finishes: mark it while downloading, clear it once ready. Any interruption in between — a
+  // model switch, closing the panel, a crash — thus leaves it marked, so it reads as "paused"
+  // (its fetched shards stay cached) rather than a first-time download on the next open.
   useEffect(() => {
-    if (modelStatus !== 'downloading' && modelStatus !== 'ready') return;
-    setPausedModels((prev) => (prev.includes(settings.webllmModel) ? prev.filter((id) => id !== settings.webllmModel) : prev));
+    const model = settings.webllmModel;
+    if (modelStatus === 'downloading') {
+      setPausedModels((prev) => (prev.includes(model) ? prev : [...prev, model]));
+    } else if (modelStatus === 'ready') {
+      setPausedModels((prev) => (prev.includes(model) ? prev.filter((id) => id !== model) : prev));
+    }
   }, [modelStatus, settings.webllmModel]);
+
+  // Persist paused downloads so they survive the panel being recreated on close/reopen.
+  useEffect(() => {
+    if (!pausedHydratedRef.current) return;
+    void browser.storage.local.set({ [PAUSED_MODELS_KEY]: pausedModels });
+  }, [pausedModels]);
 
   useEffect(() => {
     return () => {
@@ -846,17 +871,6 @@ export default function App() {
 
   async function onSaveSettings(patch: Partial<Settings>) {
     const previous = settingsRef.current;
-    // Switching away from a model that is mid-download supersedes (pauses) that download —
-    // only one model can occupy the single GPU engine slot. Remember it as resumable so the
-    // UI can offer to pick up where it left off (its fetched shards stay cached).
-    if (
-      patch.webllmModel &&
-      patch.webllmModel !== previous.webllmModel &&
-      modelStatusRef.current === 'downloading'
-    ) {
-      const paused = previous.webllmModel;
-      setPausedModels((prev) => (prev.includes(paused) ? prev : [...prev, paused]));
-    }
     // Switching model clamps the context to that model's maximum.
     let next = patch;
     if (patch.webllmModel) {
@@ -921,11 +935,19 @@ export default function App() {
           onChange={(e) => onSaveSettings({ webllmModel: e.target.value })}
           title="Model"
         >
-          {WEBLLM_MODELS.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.label} · ~{m.approxGb} GB{pausedModels.includes(m.id) ? ' · download paused' : ''}
-            </option>
-          ))}
+          {WEBLLM_MODELS.map((m) => {
+            const activelyDownloading = m.id === settings.webllmModel && modelStatus === 'downloading';
+            const suffix = activelyDownloading
+              ? ' · downloading'
+              : pausedModels.includes(m.id)
+                ? ' · download paused'
+                : '';
+            return (
+              <option key={m.id} value={m.id}>
+                {m.label} · ~{m.approxGb} GB{suffix}
+              </option>
+            );
+          })}
         </select>
         <button
           className="rounded px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
