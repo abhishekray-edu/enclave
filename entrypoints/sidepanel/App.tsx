@@ -328,7 +328,10 @@ export default function App() {
           });
         }
       }
-      // Warm start: index the page and stage the model before the first question.
+      // Resolve the model card immediately — don't wait on the debounce or (slow) page
+      // capture, so a fresh install sees the download card the moment the panel opens.
+      void stageModel();
+      // Index the current page in the background for the first question.
       schedulePrewarm(300);
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -456,40 +459,20 @@ export default function App() {
     preloadTimerRef.current = null;
   }
 
-  /** Quietly prepare for the first question: capture + chunk + embed the current page
-   *  (CPU work) and load the model into the GPU if its weights are already downloaded.
-   *  Best-effort — errors are swallowed and nothing runs while a generation streams. */
-  async function prewarm() {
+  /** Resolve the model's state — needs-download vs ready — and, when its weights are already
+   *  cached, load it onto the GPU. This is the fast path that drives the model card, so it
+   *  runs on its own and is NEVER gated behind page capture (a deep DOM walk that can take
+   *  several seconds): on a fresh install the card must appear the moment the panel opens.
+   *  A missing model is never downloaded here — the card (or an explicit question) does that. */
+  async function stageModel() {
     const s = settingsRef.current;
     // A background warm-up never contends with a generation or another engine operation
     // (e.g. an explicit download): it must not steal their status or cancel their load.
     if (!webgpuAvailable() || abortRef.current || engineOpRef.current !== null) return;
     const epoch = beginEngineOp();
-
-    // Page indexing is best-effort: capture fails on restricted pages (chrome://, stores,
-    // or when no readable tab is active) and that must NOT stop the model from staging.
-    let page: PageContent | null = null;
-    try {
-      page = await capturePage();
-    } catch {
-      /* no readable page right now — still stage the model below */
-    }
     try {
       const port = await getWebllmPort();
-      if (page) {
-        const hash = hashText(page.textContent);
-        if (
-          lastIndexedHashRef.current !== hash &&
-          estimateTokens(page.textContent) > webllmModel(s.webllmModel).safePromptTokens
-        ) {
-          await indexPage(port, page.url, hash, chunkPage(page), () => {});
-          lastIndexedHashRef.current = hash;
-        }
-      }
       if (abortRef.current || !engineOpCurrent(epoch)) return;
-      // Stage the model eagerly when its weights are already on disk. A missing model is
-      // never downloaded in the background — the first-run card (or an explicit question)
-      // starts that, with consent and a visible size.
       setModelStatus((cur) => (cur === 'ready' ? cur : 'loading'));
       const loaded = await prewarmModel(port, s.webllmModel, contextForSettings(s), (p) => {
         if (engineOpCurrent(epoch)) setLoadProgress(p);
@@ -502,6 +485,43 @@ export default function App() {
       if (engineOpCurrent(epoch)) setLoadProgress(null);
       endEngineOp(epoch);
     }
+  }
+
+  /** Index the current page for retrieval when it's over the model's single-prompt budget.
+   *  Best-effort CPU work (capture + chunk + embed) that runs independently of model staging
+   *  and never gates the model card or status. */
+  async function indexCurrentPage() {
+    const s = settingsRef.current;
+    if (!webgpuAvailable() || abortRef.current) return;
+    // Capture fails on restricted pages (chrome://, stores, or when no readable tab is
+    // active) — that's fine, there's just nothing to index.
+    let page: PageContent | null = null;
+    try {
+      page = await capturePage();
+    } catch {
+      return;
+    }
+    try {
+      const hash = hashText(page.textContent);
+      if (
+        lastIndexedHashRef.current !== hash &&
+        estimateTokens(page.textContent) > webllmModel(s.webllmModel).safePromptTokens
+      ) {
+        const port = await getWebllmPort();
+        await indexPage(port, page.url, hash, chunkPage(page), () => {});
+        lastIndexedHashRef.current = hash;
+      }
+    } catch {
+      /* indexing is best-effort; a real error surfaces on the next question */
+    }
+  }
+
+  /** Quietly prepare for the first question: resolve/stage the model (fast) and, separately,
+   *  index the current page (slow). Errors are swallowed; nothing runs while a generation
+   *  streams. Staging leads so the model card is never delayed by page capture. */
+  async function prewarm() {
+    await stageModel();
+    await indexCurrentPage();
   }
 
   /** Debounced prewarm: tab switches and page loads arrive in bursts. */
