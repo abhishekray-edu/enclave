@@ -87,6 +87,11 @@ export class VadFrameProcessor {
     this.opts = { ...this.opts, ...patch };
   }
 
+  /** True while an utterance is being buffered (speechStart fired, speechEnd hasn't). */
+  get inSpeech(): boolean {
+    return this.speaking;
+  }
+
   /** Feed one frame and its Silero speech probability. */
   process(frame: Float32Array, prob: number): VadEvent {
     const o = this.opts;
