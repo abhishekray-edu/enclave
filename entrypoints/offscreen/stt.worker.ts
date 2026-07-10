@@ -33,6 +33,14 @@ type SttWorkerRequest = LoadMsg | StartMsg | FrameMsg | MuteMsg | DuckingMsg | S
 // so the assistant's own voice / a transient can't trigger a false interruption (~160 ms of
 // clearly-voiced speech is needed to confirm an onset).
 const DUCK_PROFILE = { positiveSpeechThreshold: 0.7, negativeSpeechThreshold: 0.5, minSpeechFrames: 8, startConfirmFrames: 5 };
+// The base onset profile the ducking overrides restore (redemptionFrames is per-session and left
+// untouched).
+const BASE_ONSET = {
+  positiveSpeechThreshold: DEFAULT_VAD_OPTIONS.positiveSpeechThreshold,
+  negativeSpeechThreshold: DEFAULT_VAD_OPTIONS.negativeSpeechThreshold,
+  minSpeechFrames: DEFAULT_VAD_OPTIONS.minSpeechFrames,
+  startConfirmFrames: DEFAULT_VAD_OPTIONS.startConfirmFrames,
+};
 
 // ---- Models ----
 // Silero VAD is vendored in the extension (public/vad/); Moonshine's weights are fetched once
@@ -63,6 +71,7 @@ let vad: VadFrameProcessor | null = null;
 let pttBuffer: Float32Array[] = []; // ptt mode records everything, then transcribes on stop
 let muted = false;
 let transcribing = false;
+let ducked = false; // VAD currently in the stricter barge-in profile (TTS playing)
 // Frames are processed one at a time: Silero threads a recurrent `state` across calls, so
 // concurrent runs would corrupt it. Incoming frames queue here and a single loop drains them.
 let frameQueue: Float32Array[] = [];
@@ -143,6 +152,7 @@ function startSession(id: number, m: 'ptt' | 'auto', pauseMs?: number) {
   mode = m;
   muted = false;
   transcribing = false;
+  ducked = false;
   pttBuffer = [];
   frameQueue = [];
   // The "pause before responding" setting maps straight onto the VAD redemption window.
@@ -197,6 +207,9 @@ async function onFrame(frame: Float32Array) {
 
   const ev = vad.process(frame, prob);
   if (ev.event === 'speechStart') {
+    // A confirmed onset during playback IS the barge-in — drop the ducking so the rest of the
+    // utterance (the user's words) is captured at normal sensitivity instead of clipped.
+    if (ducked) { vad.updateOptions(BASE_ONSET); ducked = false; }
     post({ type: 'sttState', id, state: 'speech' });
   } else if (ev.event === 'speechEnd') {
     if (!ev.audio) {
@@ -308,19 +321,27 @@ self.onmessage = async (e: MessageEvent<SttWorkerRequest>) => {
     if (msg.type === 'sttDucking') {
       // Barge-in: stiffen the VAD while TTS plays, restore the base profile when it stops. The
       // session's pause (redemptionFrames) is untouched — only the onset thresholds change.
-      if (msg.active) vad?.updateOptions(DUCK_PROFILE);
-      else vad?.updateOptions({
-        positiveSpeechThreshold: DEFAULT_VAD_OPTIONS.positiveSpeechThreshold,
-        negativeSpeechThreshold: DEFAULT_VAD_OPTIONS.negativeSpeechThreshold,
-        minSpeechFrames: DEFAULT_VAD_OPTIONS.minSpeechFrames,
-        startConfirmFrames: DEFAULT_VAD_OPTIONS.startConfirmFrames,
-      });
+      ducked = msg.active;
+      if (msg.active) {
+        vad?.updateOptions(DUCK_PROFILE);
+      } else {
+        vad?.updateOptions(BASE_ONSET);
+        // Playback ended. If we aren't mid a real (user) utterance, discard whatever the VAD
+        // buffered during playback — mostly the assistant's own voice bleeding into the mic — so
+        // the next turn starts from a clean slate and isn't transcribed as garbled echo.
+        if (vad && !vad.inSpeech) {
+          vad.reset();
+          resetSileroState();
+          frameQueue = [];
+        }
+      }
       return;
     }
     if (msg.type === 'sttStop') { await stop(msg.flush); return; }
     if (msg.type === 'sttRelease') {
       activeId = null;
       vad = null;
+      ducked = false;
       pttBuffer = [];
       frameQueue = [];
       sileroSession = null;
