@@ -77,6 +77,8 @@ export interface Settings {
   compressContext: boolean;
   /** Boost retrieved chunks currently visible in the viewport (experimental; off by default). */
   viewportBoost: boolean;
+  /** Read each new assistant reply aloud automatically when it finishes (off by default). */
+  ttsAutoRead: boolean;
 }
 
 export const SYSTEM_PROMPT =
@@ -90,6 +92,7 @@ export const DEFAULT_SETTINGS: Settings = {
   systemPrompt: SYSTEM_PROMPT,
   compressContext: false,
   viewportBoost: false,
+  ttsAutoRead: false,
 };
 
 // ---- Messaging protocol (runtime.sendMessage) ----

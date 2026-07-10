@@ -92,7 +92,13 @@ export type PanelToOffscreen =
   | { type: 'index'; id: number; url: string; contentHash: string; chunks: Chunk[] }
   | { type: 'retrieve'; id: number; url: string; contentHash: string; query: string; topK: number }
   | { type: 'compress'; id: number; texts: string[]; rate: number }
-  | { type: 'interrupt'; id?: number };
+  | { type: 'interrupt'; id?: number }
+  // Text-to-speech (pocket-tts). PCM never crosses this port — it plays in the offscreen
+  // document; only these small command/status messages travel over the Port.
+  | { type: 'ttsLoad'; id: number }
+  | { type: 'ttsSpeak'; id: number; text: string }
+  | { type: 'ttsStop' }
+  | { type: 'ttsRelease' };
 
 export type OffscreenToPanel =
   | { type: 'progress'; id: number; report: LoadProgress }
@@ -108,7 +114,12 @@ export type OffscreenToPanel =
   | { type: 'embedProgress'; id: number; report: LoadProgress }
   | { type: 'indexed'; id: number; chunkCount: number; fromCache: boolean }
   | { type: 'retrieved'; id: number; results: RetrievedChunk[] }
-  | { type: 'compressed'; id: number; texts: string[] };
+  | { type: 'compressed'; id: number; texts: string[] }
+  // Text-to-speech status (playback happens in the offscreen doc; no audio data here).
+  | { type: 'ttsProgress'; id: number; progress: number }
+  | { type: 'ttsReady'; id: number }
+  | { type: 'ttsEnded'; id: number }
+  | { type: 'ttsError'; id: number; message: string };
 
 export type WebllmPort = ReturnType<typeof browser.runtime.connect>;
 

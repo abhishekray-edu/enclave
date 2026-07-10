@@ -14,6 +14,14 @@ stats-*.json
 .wxt
 web-ext.config.ts
 
+# pocket-tts tokenizer test fixture — not redistributed (upstream model terms). Regenerate
+# per lib/__tests__/fixtures/README.md; the tokenizer test auto-skips when it's absent.
+lib/__tests__/fixtures/tokenizer.model
+
+# Generated pocket-tts voice-model assets (~126 MB) — hosted on Hugging Face, never in git.
+# Rebuild with `node scripts/prepare-tts-assets.mjs`.
+tts-assets/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

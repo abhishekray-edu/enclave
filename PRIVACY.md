@@ -24,10 +24,18 @@ is no backend — the extension has nothing to send data to even if it wanted to
 
 ## Network requests
 
-The only network traffic Enclave makes is the **one-time download of model weights**
-(from Hugging Face / WebLLM's public CDNs) the first time you select a model. This
-downloads the model file to your machine, where it's cached by the browser for reuse.
-No page content, questions, or personal information is included in these requests.
+The only network traffic Enclave makes is the **one-time download of model files** the
+first time you use a feature that needs them, from public model hosts:
+
+- the **language model** weights (WebLLM's public CDN) the first time you select a model;
+- the **embedding model** used for reading long pages (Hugging Face), on first use;
+- the **text-to-speech voice** (pocket-tts, ~132 MB) from a public Hugging Face repository,
+  the first time you press "Speak" or enable "Read replies aloud automatically".
+
+Each downloads model files to your machine, where the browser caches them for reuse. No page
+content, questions, answers, or personal information is included in these requests. The
+text-to-speech synthesis itself then runs entirely on-device — the text being spoken is never
+transmitted.
 
 ## No telemetry, analytics, or accounts
 
@@ -48,7 +56,7 @@ right-click menu, or pressing the keyboard shortcut):
 - **contextMenus** — to add the right-click "Ask Enclave" / "Explain selection" actions.
 - **storage** — to save your settings and cache processed page text locally.
 - **offscreen** — to run the local model (WebGPU/WASM inference) outside the panel's
-  lifecycle.
+  lifecycle, and to play synthesized speech for the "Speak" feature.
 
 None of these permissions are used to monitor browsing activity in the background or on
 tabs other than the one you're actively working with.
