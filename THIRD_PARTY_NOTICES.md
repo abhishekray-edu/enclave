@@ -72,6 +72,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 - @huggingface/transformers / Transformers.js (Apache-2.0) — RAG embeddings and Moonshine STT.
 - @mozilla/readability (Apache-2.0), react (MIT), react-markdown (MIT), highlight.js (BSD-3),
   js-tiktoken (MIT), @atjsh/llmlingua-2 (MIT).
+- KaTeX (MIT) — math rendering (`remark-math` / `rehype-katex`, both MIT); the KaTeX fonts are
+  bundled under the SIL Open Font License 1.1.
+- lucide (ISC) — the inline SVG icon geometry in `entrypoints/sidepanel/icons.tsx` is
+  hand-copied from lucide's icon set; no package is bundled.
 
 Model weights for the LLMs are downloaded from their respective providers' CDNs under their own
 licenses at first use, and are not redistributed by this project.

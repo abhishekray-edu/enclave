@@ -1,5 +1,12 @@
 import { browser } from 'wxt/browser';
-import { DEFAULT_SETTINGS, MAX_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, type Settings } from './types';
+import {
+  DEFAULT_SETTINGS,
+  MAX_CONTEXT_TOKENS,
+  MAX_VOICE_PAUSE_MS,
+  MIN_CONTEXT_TOKENS,
+  MIN_VOICE_PAUSE_MS,
+  type Settings,
+} from './types';
 import { defaultModelForDevice } from './webllmClient';
 
 const KEY = 'settings';
@@ -9,11 +16,18 @@ function clampContext(ctx: number): number {
   return Math.max(MIN_CONTEXT_TOKENS, Math.min(MAX_CONTEXT_TOKENS, Math.round(ctx)));
 }
 
+function clamp(value: number, lo: number, hi: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(lo, Math.min(hi, value));
+}
+
 function normalizeSettings(settings: Settings): Settings {
   return {
     ...settings,
     webllmCtx: clampContext(settings.webllmCtx),
     systemPrompt: DEFAULT_SETTINGS.systemPrompt,
+    voicePauseMs: clamp(settings.voicePauseMs, MIN_VOICE_PAUSE_MS, MAX_VOICE_PAUSE_MS, DEFAULT_SETTINGS.voicePauseMs),
+    repetitionPenalty: clamp(settings.repetitionPenalty, 0, 1, DEFAULT_SETTINGS.repetitionPenalty),
   };
 }
 

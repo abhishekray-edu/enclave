@@ -17,7 +17,8 @@ export interface VadOptions {
   positiveSpeechThreshold: number;
   /** Probability below which a frame counts toward ending the utterance. */
   negativeSpeechThreshold: number;
-  /** Consecutive sub-threshold frames tolerated before the utterance ends (~0.5 s). */
+  /** Consecutive sub-threshold frames tolerated before the utterance ends. The default (~1.2 s)
+   *  is overridden per-session from the user's "pause before responding" setting. */
   redemptionFrames: number;
   /** Frames of retained audio before the first speech frame (~onset padding). */
   preSpeechPadFrames: number;
@@ -25,16 +26,26 @@ export interface VadOptions {
   minSpeechFrames: number;
   /** Hard cap on utterance length; forces an end so a stuck VAD can't buffer forever (~30 s). */
   maxSpeechFrames: number;
+  /** Consecutive positive frames required before an utterance is confirmed to have started.
+   *  1 = start on the first positive frame (default). Raised during TTS playback (barge-in) so a
+   *  cough or the tail of the assistant's own voice can't trigger a false interruption. */
+  startConfirmFrames: number;
 }
 
 export const DEFAULT_VAD_OPTIONS: VadOptions = {
   positiveSpeechThreshold: 0.5,
   negativeSpeechThreshold: 0.35,
-  redemptionFrames: 16,
+  redemptionFrames: 38, // ~1.2 s at 31.25 frames/sec
   preSpeechPadFrames: 8,
   minSpeechFrames: 4,
   maxSpeechFrames: Math.round(30 * FRAMES_PER_SEC),
+  startConfirmFrames: 1,
 };
+
+/** Convert a "pause before responding" duration (ms) to VAD redemption frames. */
+export function pauseMsToRedemptionFrames(pauseMs: number): number {
+  return Math.max(1, Math.round((pauseMs / 1000) * FRAMES_PER_SEC));
+}
 
 export type VadEvent =
   | { event: 'none' }
@@ -55,16 +66,25 @@ function concatFrames(frames: Float32Array[]): Float32Array {
 }
 
 export class VadFrameProcessor {
-  private readonly opts: VadOptions;
+  private opts: VadOptions;
   private speaking = false;
   private redemption = 0;
   private positiveFrames = 0;
   private speechFrames: Float32Array[] = [];
   /** Rolling window of the most recent frames while idle (the pre-speech pad). */
   private preBuffer: Float32Array[] = [];
+  /** Positive frames seen since a potential onset, awaiting confirmation (startConfirmFrames). */
+  private pendingStart: Float32Array[] = [];
+  private pendingPositive = 0;
 
   constructor(opts: Partial<VadOptions> = {}) {
     this.opts = { ...DEFAULT_VAD_OPTIONS, ...opts };
+  }
+
+  /** Adjust options mid-session (e.g. raise thresholds during TTS playback for barge-in).
+   *  Applies from the next frame; does not disturb an utterance already in progress. */
+  updateOptions(patch: Partial<VadOptions>): void {
+    this.opts = { ...this.opts, ...patch };
   }
 
   /** Feed one frame and its Silero speech probability. */
@@ -72,13 +92,36 @@ export class VadFrameProcessor {
     const o = this.opts;
     if (!this.speaking) {
       if (prob >= o.positiveSpeechThreshold) {
-        // Utterance = the retained pre-speech pad (prior idle frames) + this first speech frame.
-        this.speaking = true;
-        this.redemption = 0;
-        this.positiveFrames = 1;
-        this.speechFrames = [...this.preBuffer, frame];
-        this.preBuffer = [];
-        return { event: 'speechStart' };
+        this.pendingStart.push(frame);
+        this.pendingPositive++;
+        if (this.pendingPositive >= o.startConfirmFrames) {
+          // Confirmed: utterance = retained pre-speech pad + the confirming frames.
+          this.speaking = true;
+          this.redemption = 0;
+          this.positiveFrames = this.pendingPositive;
+          this.speechFrames = [...this.preBuffer, ...this.pendingStart];
+          this.preBuffer = [];
+          this.pendingStart = [];
+          this.pendingPositive = 0;
+          return { event: 'speechStart' };
+        }
+        return { event: 'none' }; // still confirming the onset
+      }
+      // Non-positive frame while a burst was being confirmed.
+      if (this.pendingStart.length) {
+        if (prob < o.negativeSpeechThreshold) {
+          // The burst wasn't sustained speech (cough / TTS transient): fold it back into the pad.
+          for (const f of this.pendingStart) {
+            this.preBuffer.push(f);
+            if (this.preBuffer.length > o.preSpeechPadFrames) this.preBuffer.shift();
+          }
+          this.pendingStart = [];
+          this.pendingPositive = 0;
+        } else {
+          // Between thresholds: keep it as part of the potential onset, don't count or collapse.
+          this.pendingStart.push(frame);
+          return { event: 'none' };
+        }
       }
       // Idle frame: keep it in the rolling pre-speech pad so a following onset isn't clipped.
       this.preBuffer.push(frame);
@@ -117,6 +160,8 @@ export class VadFrameProcessor {
     this.positiveFrames = 0;
     this.speechFrames = [];
     this.preBuffer = [];
+    this.pendingStart = [];
+    this.pendingPositive = 0;
   }
 
   /** Finish the current utterance. When ended via redemption, trim the trailing silence and

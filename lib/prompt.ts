@@ -1,5 +1,14 @@
 import type { ChatMessage, PageBlock, PageContent, RetrievedChunk, Settings } from './types';
 
+/** Appended to the system prompt when a request comes in by voice: the reply will be read aloud
+ *  by TTS, so it must be spoken-style prose, not a formatted document. */
+export const VOICE_REPLY_DIRECTIVE =
+  'The user is speaking to you by voice and will hear your reply read aloud by a text-to-speech ' +
+  'voice. Reply as natural spoken conversation: plain prose only — no markdown, headings, bullet ' +
+  'points, numbered lists, code blocks, tables, LaTeX, or emoji, and never read out URLs. Say ' +
+  'numbers and symbols the way a person would say them aloud. Be direct: answer simple questions ' +
+  'in one or two sentences, and only go longer when the question genuinely needs it.';
+
 /** Rough token estimate (~4 chars/token for English). Good enough for budgeting. */
 export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);

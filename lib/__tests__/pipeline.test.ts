@@ -78,7 +78,7 @@ describe('buildMessages — structure-aware truncation (large page)', () => {
       ],
     });
     // ctx small enough that only ~1 section fits after the ~1024-token answer reserve.
-    const built = buildMessages(DEFAULT_SETTINGS, p, [], 1200);
+    const built = buildMessages(DEFAULT_SETTINGS, p, [], 1300);
     const body = built.messages[0].content;
     expect(built.truncated).toBe(true);
     expect(body).toContain('SECTION_ONE');

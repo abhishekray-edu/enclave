@@ -50,4 +50,15 @@ describe('voiceReducer', () => {
   it("'muted' status keeps the current phase", () => {
     expect(voiceReducer('listening', { type: 'sttState', state: 'muted' })).toBe('listening');
   });
+
+  it('bargeIn starts a new utterance only while thinking or speaking', () => {
+    expect(voiceReducer('thinking', { type: 'bargeIn' })).toBe('speech');
+    expect(voiceReducer('speaking', { type: 'bargeIn' })).toBe('speech');
+  });
+
+  it('bargeIn is ignored from every other state', () => {
+    for (const s of ['off', 'listening', 'speech', 'transcribing'] as VoiceState[]) {
+      expect(voiceReducer(s, { type: 'bargeIn' })).toBe(s);
+    }
+  });
 });

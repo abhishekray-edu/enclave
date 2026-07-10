@@ -79,6 +79,8 @@ export interface GenerateOptions {
   responseFormat?: { type: 'json_object'; schema?: string };
   /** Qwen3 only: disable the <think> phase (used for JSON extraction). */
   enableThinking?: boolean;
+  /** Frequency penalty (0..1) to discourage repeated text; omitted/0 leaves it off. */
+  frequencyPenalty?: number;
   /** Stream deltas (default) vs return one result. JSON extraction uses false. */
   stream?: boolean;
 }
@@ -97,12 +99,17 @@ export type PanelToOffscreen =
   // document; only these small command/status messages travel over the Port.
   | { type: 'ttsLoad'; id: number }
   | { type: 'ttsSpeak'; id: number; text: string }
+  // Streamed speech: open a session, append sentences as the LLM produces them, then finish.
+  // Audio streams out as the panel is still generating (see lib/ttsClient.ts ttsSpeakStream).
+  | { type: 'ttsSpeakStream'; id: number }
+  | { type: 'ttsAppend'; id: number; seq: number; text: string }
+  | { type: 'ttsFinish'; id: number }
   | { type: 'ttsStop' }
   | { type: 'ttsRelease' }
   // Speech-to-text (Moonshine + Silero VAD). Mic PCM never crosses this Port either — it is
   // captured and transcribed in the offscreen doc; only these control/status messages travel.
   | { type: 'sttLoad'; id: number }
-  | { type: 'sttStart'; id: number; mode: 'ptt' | 'auto' }
+  | { type: 'sttStart'; id: number; mode: 'ptt' | 'auto'; pauseMs?: number; bargeIn?: boolean }
   | { type: 'sttMute'; muted: boolean }
   | { type: 'sttStop'; flush?: boolean }
   | { type: 'sttRelease' };
@@ -126,6 +133,9 @@ export type OffscreenToPanel =
   | { type: 'ttsProgress'; id: number; progress: number }
   | { type: 'ttsReady'; id: number }
   | { type: 'ttsEnded'; id: number }
+  // A streamed sentence's audio has begun playing — carries the append `seq` so the panel can
+  // reveal the displayed text in step with the spoken audio.
+  | { type: 'ttsChunkStarted'; id: number; seq: number }
   | { type: 'ttsError'; id: number; message: string }
   // Speech-to-text status. `id` ties messages to the sttLoad/sttStart request that owns them.
   | { type: 'sttProgress'; id: number; progress: number }

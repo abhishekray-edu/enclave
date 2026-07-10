@@ -78,4 +78,27 @@ describe('VadFrameProcessor', () => {
     const vad = new VadFrameProcessor(OPTS);
     expect(vad.flush().event).toBe('none');
   });
+
+  it('startConfirmFrames defers speechStart until enough positive frames arrive', () => {
+    const vad = new VadFrameProcessor({ ...OPTS, startConfirmFrames: 3, preSpeechPadFrames: 0 });
+    expect(vad.process(f(0), 0.9).event).toBe('none'); // confirming 1
+    expect(vad.process(f(1), 0.9).event).toBe('none'); // confirming 2
+    expect(vad.process(f(2), 0.9).event).toBe('speechStart'); // confirmed on 3rd
+  });
+
+  it('a collapsed onset (burst then silence) never emits speechStart', () => {
+    const vad = new VadFrameProcessor({ ...OPTS, startConfirmFrames: 5, preSpeechPadFrames: 2 });
+    expect(vad.process(f(0), 0.9).event).toBe('none'); // confirming 1
+    expect(vad.process(f(1), 0.9).event).toBe('none'); // confirming 2
+    expect(vad.process(f(2), 0.1).event).toBe('none'); // collapse — folds back to the pad
+    // Still idle: a fresh, sustained onset must confirm from scratch.
+    expect(vad.process(f(3), 0.9).event).toBe('none');
+  });
+
+  it('updateOptions applies from the next frame', () => {
+    const vad = new VadFrameProcessor({ ...OPTS, startConfirmFrames: 1 });
+    vad.updateOptions({ startConfirmFrames: 2 });
+    expect(vad.process(f(0), 0.9).event).toBe('none'); // now needs 2 to confirm
+    expect(vad.process(f(1), 0.9).event).toBe('speechStart');
+  });
 });

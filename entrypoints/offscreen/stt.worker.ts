@@ -17,16 +17,22 @@
 import * as ort from 'onnxruntime-web/wasm';
 import { pipeline, type AutomaticSpeechRecognitionPipeline } from '@huggingface/transformers';
 import { configureOrtRuntime } from '@/lib/ortEnv';
-import { VadFrameProcessor, VAD_FRAME_SAMPLES } from '@/lib/vadFrameProcessor';
+import { VadFrameProcessor, VAD_FRAME_SAMPLES, DEFAULT_VAD_OPTIONS, pauseMsToRedemptionFrames } from '@/lib/vadFrameProcessor';
 
 // ---- Message protocol (offscreen main.ts <-> this worker) ----
 interface LoadMsg { type: 'sttLoad'; id: number }
-interface StartMsg { type: 'sttStart'; id: number; mode: 'ptt' | 'auto' }
+interface StartMsg { type: 'sttStart'; id: number; mode: 'ptt' | 'auto'; pauseMs?: number }
 interface FrameMsg { type: 'frame'; data: Float32Array }
 interface MuteMsg { type: 'sttMute'; muted: boolean }
+interface DuckingMsg { type: 'sttDucking'; active: boolean }
 interface StopMsg { type: 'sttStop'; flush?: boolean }
 interface ReleaseMsg { type: 'sttRelease' }
-type SttWorkerRequest = LoadMsg | StartMsg | FrameMsg | MuteMsg | StopMsg | ReleaseMsg;
+type SttWorkerRequest = LoadMsg | StartMsg | FrameMsg | MuteMsg | DuckingMsg | StopMsg | ReleaseMsg;
+
+// While TTS is audibly playing (barge-in mode), the mic stays live but the VAD is made stricter
+// so the assistant's own voice / a transient can't trigger a false interruption (~160 ms of
+// clearly-voiced speech is needed to confirm an onset).
+const DUCK_PROFILE = { positiveSpeechThreshold: 0.7, negativeSpeechThreshold: 0.5, minSpeechFrames: 8, startConfirmFrames: 5 };
 
 // ---- Models ----
 // Silero VAD is vendored in the extension (public/vad/); Moonshine's weights are fetched once
@@ -132,14 +138,17 @@ function isNoiseTranscript(text: string): boolean {
   return words.length < 2;
 }
 
-function startSession(id: number, m: 'ptt' | 'auto') {
+function startSession(id: number, m: 'ptt' | 'auto', pauseMs?: number) {
   activeId = id;
   mode = m;
   muted = false;
   transcribing = false;
   pttBuffer = [];
   frameQueue = [];
-  vad = new VadFrameProcessor();
+  // The "pause before responding" setting maps straight onto the VAD redemption window.
+  vad = new VadFrameProcessor(
+    pauseMs != null ? { redemptionFrames: pauseMsToRedemptionFrames(pauseMs) } : {},
+  );
   resetSileroState();
   post({ type: 'sttState', id, state: 'listening' });
 }
@@ -289,11 +298,23 @@ self.onmessage = async (e: MessageEvent<SttWorkerRequest>) => {
       }
       return;
     }
-    if (msg.type === 'sttStart') { startSession(msg.id, msg.mode); return; }
+    if (msg.type === 'sttStart') { startSession(msg.id, msg.mode, msg.pauseMs); return; }
     if (msg.type === 'sttMute') {
       muted = msg.muted;
       if (muted) { vad?.reset(); resetSileroState(); frameQueue = []; }
       else if (activeId != null && !transcribing) post({ type: 'sttState', id: activeId, state: 'listening' });
+      return;
+    }
+    if (msg.type === 'sttDucking') {
+      // Barge-in: stiffen the VAD while TTS plays, restore the base profile when it stops. The
+      // session's pause (redemptionFrames) is untouched — only the onset thresholds change.
+      if (msg.active) vad?.updateOptions(DUCK_PROFILE);
+      else vad?.updateOptions({
+        positiveSpeechThreshold: DEFAULT_VAD_OPTIONS.positiveSpeechThreshold,
+        negativeSpeechThreshold: DEFAULT_VAD_OPTIONS.negativeSpeechThreshold,
+        minSpeechFrames: DEFAULT_VAD_OPTIONS.minSpeechFrames,
+        startConfirmFrames: DEFAULT_VAD_OPTIONS.startConfirmFrames,
+      });
       return;
     }
     if (msg.type === 'sttStop') { await stop(msg.flush); return; }
