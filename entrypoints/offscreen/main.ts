@@ -5,6 +5,7 @@ import type { WebWorkerMLCEngine } from '@mlc-ai/web-llm';
 import { createWebllmEngine, chatStreamWebllm, chatCompleteWebllm, isModelCached } from '@/lib/webllm';
 import { createModelLoader } from '@/lib/modelLoader';
 import { PORT_NAME, type OffscreenToPanel, type PanelToOffscreen, type WebllmPort } from '@/lib/webllmClient';
+import { TtsPlayer } from '@/lib/ttsPlayer';
 // NOTE: lib/retrieval (Transformers.js + onnxruntime) and lib/compress (LLMLingua-2) run in
 // a dedicated worker (ml.worker.ts, created lazily) so a plain Q&A never loads that heavy
 // machinery AND embedding never blocks this document's main thread — the side panel usually
@@ -69,6 +70,58 @@ function send(port: WebllmPort, msg: OffscreenToPanel) {
   }
 }
 
+// ---- Text-to-speech (pocket-tts): CPU inference in a dedicated worker; playback here in the
+//      offscreen doc (created with the AUDIO_PLAYBACK reason). PCM never crosses the Port. ----
+let ttsWorker: Worker | null = null;
+let ttsPlayer: TtsPlayer | null = null;
+let ttsPort: WebllmPort | null = null; // the panel port that owns current TTS
+let ttsSpeakId: number | null = null; // id of the in-flight speak (for the ttsEnded reply)
+
+/** Emit ttsEnded exactly once for the current speak, if one is outstanding. */
+function finishSpeak() {
+  if (ttsPort && ttsSpeakId != null) {
+    send(ttsPort, { type: 'ttsEnded', id: ttsSpeakId });
+    ttsSpeakId = null;
+  }
+}
+
+function ensureTtsWorker(): Worker {
+  if (!ttsWorker) {
+    ttsWorker = new Worker(new URL('./tts.worker.ts', import.meta.url), { type: 'module' });
+    ttsPlayer = new TtsPlayer();
+    ttsPlayer.onEnded(finishSpeak);
+    ttsWorker.onmessage = (e: MessageEvent) => {
+      const msg = e.data as
+        | { type: 'audioChunk'; data: Float32Array; sampleRate: number }
+        | { type: 'ttsSpeakDone'; id: number }
+        | { type: 'ttsProgress'; id: number; progress: number }
+        | { type: 'ttsReady'; id: number }
+        | { type: 'ttsError'; id: number; message: string };
+      if (msg.type === 'audioChunk') {
+        void ttsPlayer?.play(msg.data, msg.sampleRate);
+      } else if (msg.type === 'ttsSpeakDone') {
+        // Generation finished; signal end-of-stream so the player fires onEnded once drained.
+        ttsPlayer?.end();
+      } else if (msg.type === 'ttsError') {
+        ttsPlayer?.stop();
+        ttsSpeakId = null;
+        if (ttsPort) send(ttsPort, msg);
+      } else {
+        if (ttsPort) send(ttsPort, msg); // ttsProgress / ttsReady
+      }
+    };
+  }
+  return ttsWorker;
+}
+
+function releaseTts() {
+  ttsSpeakId = null;
+  void ttsPlayer?.dispose();
+  ttsPlayer = null;
+  ttsWorker?.terminate();
+  ttsWorker = null;
+}
+
 /** Ensure the requested model + context is loaded, reusing it if already resident. */
 async function ensureModel(
   model: string,
@@ -84,8 +137,45 @@ async function ensureModel(
 browser.runtime.onConnect.addListener((port) => {
   if (port.name !== PORT_NAME) return;
 
+  // Stop any speech this port owns when the panel closes (offscreen audio would otherwise
+  // keep talking after the UI is gone).
+  port.onDisconnect.addListener(() => {
+    if (ttsPort === port) {
+      ttsWorker?.postMessage({ type: 'ttsStop' });
+      ttsPlayer?.stop();
+      ttsPort = null;
+      ttsSpeakId = null;
+    }
+  });
+
   port.onMessage.addListener(async (raw) => {
     const msg = raw as PanelToOffscreen;
+
+    if (msg.type === 'ttsLoad') {
+      ttsPort = port;
+      ensureTtsWorker().postMessage({ type: 'ttsLoad', id: msg.id });
+      return;
+    }
+
+    if (msg.type === 'ttsSpeak') {
+      ttsPort = port;
+      ttsSpeakId = msg.id;
+      ttsPlayer?.stop(); // clear any previous utterance before the new one
+      ensureTtsWorker().postMessage({ type: 'ttsSpeak', id: msg.id, text: msg.text });
+      return;
+    }
+
+    if (msg.type === 'ttsStop') {
+      ttsWorker?.postMessage({ type: 'ttsStop' });
+      ttsPlayer?.stop();
+      finishSpeak();
+      return;
+    }
+
+    if (msg.type === 'ttsRelease') {
+      releaseTts();
+      return;
+    }
 
     if (msg.type === 'init') {
       try {

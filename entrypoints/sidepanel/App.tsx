@@ -22,6 +22,7 @@ import {
   type WebllmPort,
 } from '@/lib/webllmClient';
 import { isLoadInterruption } from '@/lib/modelLoader';
+import { ttsLoad, ttsSpeak, ttsStop, ttsRelease, TTS_DOWNLOAD_MB } from '@/lib/ttsClient';
 import { buildMessages, pageBudgetTokens, estimateTokens, type BuiltPrompt } from '@/lib/prompt';
 import { chunkPage } from '@/lib/chunking';
 import { summarizeChunks } from '@/lib/summarize';
@@ -110,6 +111,22 @@ function stripThink(text: string): string {
   return out.replace(/^\s+/, '');
 }
 
+/** Reduce displayed markdown to plain prose for speech — drop code blocks and syntax so the
+ *  TTS voice reads words, not backticks and link URLs. */
+function toPlainText(md: string): string {
+  return md
+    .replace(/```[\s\S]*?```/g, ' ') // fenced code blocks
+    .replace(/`([^`]+)`/g, '$1') // inline code
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, ' ') // images
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1') // links → link text
+    .replace(/^#{1,6}\s+/gm, '') // heading markers
+    .replace(/^\s*[-*+]\s+/gm, '') // bullet markers
+    .replace(/^\s*\d+\.\s+/gm, '') // ordered-list markers
+    .replace(/[*_~>#]/g, '') // emphasis / blockquote marks
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function contextForSettings(s: Settings): number {
   return Math.max(MIN_CONTEXT_TOKENS, Math.min(s.webllmCtx, MAX_CONTEXT_TOKENS, webllmModel(s.webllmModel).maxCtx));
 }
@@ -131,6 +148,35 @@ function ThinkingIndicator() {
         <span />
       </span>
     </div>
+  );
+}
+
+/** Read-aloud control shown under each finished assistant reply. Shows a download percentage
+ *  the first time (while the ~178 MB voice model fetches), then toggles Speak ⇄ Stop. */
+function SpeakButton({
+  active,
+  downloading,
+  downloadPct,
+  disabled,
+  onClick,
+}: {
+  active: boolean;
+  downloading: boolean;
+  downloadPct: number;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  const label = downloading ? `Downloading voice… ${downloadPct}%` : active ? 'Stop' : 'Speak';
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={active ? 'Stop reading' : `Read this reply aloud${!downloading ? ` (downloads a ~${TTS_DOWNLOAD_MB} MB voice on first use)` : ''}`}
+      className="mt-2 inline-flex items-center gap-1 rounded border border-zinc-300 px-2 py-0.5 text-[11px] text-zinc-500 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
+    >
+      <span aria-hidden="true">{active && !downloading ? '■' : '▶'}</span>
+      {label}
+    </button>
   );
 }
 
@@ -236,6 +282,16 @@ export default function App() {
   /** Models whose download was interrupted (superseded by switching to another model) and
    *  is resumable. Their fetched weight shards stay cached, so re-downloading resumes. */
   const [pausedModels, setPausedModels] = useState<string[]>([]);
+  // Text-to-speech (pocket-tts). The voice model downloads once on first Speak; `speakingIdx`
+  // marks which message is currently being read (or downloading) so its button shows Stop.
+  const [ttsReady, setTtsReady] = useState(false);
+  const [ttsDownloading, setTtsDownloading] = useState(false);
+  const [ttsDownloadPct, setTtsDownloadPct] = useState(0);
+  const [speakingIdx, setSpeakingIdx] = useState<number | null>(null);
+  const [ttsError, setTtsError] = useState<string | null>(null);
+  const ttsReadyRef = useRef(false);
+  const ttsDownloadingRef = useRef(false);
+  const speakingIdxRef = useRef<number | null>(null);
   const suggestedModelId = defaultModelForDevice();
   /** The model card is the one place downloads happen: it shows whenever the selected
    *  model's weights aren't on disk — on first run and mid-chat alike. */
@@ -378,6 +434,11 @@ export default function App() {
   async function releaseModel() {
     cancelScheduledPreload();
     const epoch = beginEngineOp();
+    // Closing the offscreen doc destroys the TTS worker too — reset so the next Speak reloads.
+    ttsReadyRef.current = false;
+    setTtsReady(false);
+    setSpeakingIdx(null);
+    speakingIdxRef.current = null;
     portRef.current?.disconnect();
     portRef.current = null;
     await releaseOffscreen();
@@ -576,6 +637,78 @@ export default function App() {
     if (el) shouldAutoScrollRef.current = isNearBottom(el);
   }
 
+  /** Stop any in-flight speech. */
+  function stopSpeaking() {
+    if (portRef.current) ttsStop(portRef.current);
+    setSpeakingIdx(null);
+    speakingIdxRef.current = null;
+  }
+
+  /** Read message `idx` aloud. First call downloads the ~178 MB voice model (once). Clicking
+   *  the same message while it speaks stops it; speaking a different one interrupts the first. */
+  async function speakMessage(idx: number, rawText: string) {
+    const plain = toPlainText(stripThink(rawText));
+    if (!plain) return;
+    const port = await getWebllmPort();
+
+    // Toggle off when this same message is already speaking.
+    if (speakingIdxRef.current === idx && !ttsDownloadingRef.current) {
+      stopSpeaking();
+      return;
+    }
+    // Interrupt whatever else is speaking.
+    if (speakingIdxRef.current != null) ttsStop(port);
+
+    setTtsError(null);
+    setSpeakingIdx(idx);
+    speakingIdxRef.current = idx;
+
+    if (!ttsReadyRef.current) {
+      setTtsDownloading(true);
+      ttsDownloadingRef.current = true;
+      setTtsDownloadPct(0);
+      try {
+        await ttsLoad(port, (p) => setTtsDownloadPct(Math.round(p * 100)));
+        ttsReadyRef.current = true;
+        setTtsReady(true);
+      } catch (e) {
+        setTtsError(e instanceof Error ? e.message : String(e));
+        setSpeakingIdx(null);
+        speakingIdxRef.current = null;
+        return;
+      } finally {
+        setTtsDownloading(false);
+        ttsDownloadingRef.current = false;
+      }
+    }
+    // The user may have stopped/switched during the download.
+    if (speakingIdxRef.current !== idx) return;
+
+    try {
+      await ttsSpeak(port, plain);
+    } catch (e) {
+      setTtsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      if (speakingIdxRef.current === idx) {
+        setSpeakingIdx(null);
+        speakingIdxRef.current = null;
+      }
+    }
+  }
+
+  /** Speak the just-finished reply when auto-read is enabled (skips structured/empty). */
+  function autoRead(idx: number, text: string) {
+    if (settingsRef.current.ttsAutoRead && text.trim()) void speakMessage(idx, text);
+  }
+
+  /** Free the voice model's sessions (Settings). The offscreen worker unloads; next Speak reloads. */
+  function releaseVoiceModel() {
+    if (portRef.current) ttsRelease(portRef.current);
+    stopSpeaking();
+    ttsReadyRef.current = false;
+    setTtsReady(false);
+  }
+
   async function submit(
     text: string,
     opts?: { selectionOverride?: string; task?: TaskSpec; schema?: ExtractionSchema },
@@ -583,9 +716,14 @@ export default function App() {
     const trimmed = text.trim();
     if (!trimmed || streaming) return;
 
+    // A new question interrupts any speech from the previous reply.
+    stopSpeaking();
+
     const s = settingsRef.current;
     const spec = opts?.task ?? TASKS.ask;
     const conversation: ChatMessage[] = [...messagesRef.current, { role: 'user', content: trimmed }];
+    // Index of the assistant reply we're about to stream (for auto-read on completion).
+    const assistantIdx = conversation.length;
     shouldAutoScrollRef.current = true;
     setMessages([...conversation, { role: 'assistant', content: '' }]);
     setInput('');
@@ -781,6 +919,7 @@ export default function App() {
           },
         );
         setLastAssistant(summary || (controller.signal.aborted ? '_(stopped)_' : '_(no response)_'));
+        if (summary && !controller.signal.aborted) autoRead(assistantIdx, summary);
       } else if (spec.outputMode === 'json') {
         // Structured extraction: one non-streaming call, parse, store as a structured message.
         let raw: string;
@@ -825,6 +964,7 @@ export default function App() {
           setLastAssistant(acc);
         }
         if (!acc) setLastAssistant(controller.signal.aborted ? '_(stopped)_' : '_(no response)_');
+        else if (!controller.signal.aborted) autoRead(assistantIdx, acc);
       }
     } catch (e) {
       if (controller.signal.aborted) {
@@ -947,12 +1087,31 @@ export default function App() {
       )}
 
       {/* Settings panel */}
-      {showSettings && <SettingsPanel settings={settings} onSave={onSaveSettings} onRelease={releaseModel} busy={streaming} />}
+      {showSettings && (
+        <SettingsPanel
+          settings={settings}
+          onSave={onSaveSettings}
+          onRelease={releaseModel}
+          busy={streaming}
+          ttsLoaded={ttsReady}
+          onReleaseVoice={releaseVoiceModel}
+        />
+      )}
 
       {/* Transient work-in-progress note (cleared whenever nothing is running) */}
       {pageNote && (
         <div className="border-b border-zinc-200 bg-zinc-100 px-3 py-1.5 text-[11px] text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-400">
           {pageNote}
+        </div>
+      )}
+
+      {/* Text-to-speech error (voice download / synthesis) */}
+      {ttsError && (
+        <div className="flex items-center justify-between gap-2 border-b border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
+          <span>Voice: {ttsError}</span>
+          <button className="shrink-0 underline" onClick={() => setTtsError(null)}>
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -971,7 +1130,8 @@ export default function App() {
           ))}
         {messages.map((m, i) => {
           const isUser = m.role === 'user';
-          const isPlaceholder = !m.content && streaming && i === messages.length - 1;
+          const isStreamingThis = streaming && i === messages.length - 1;
+          const isPlaceholder = !m.content && isStreamingThis;
           return (
             <div
               key={i}
@@ -990,7 +1150,22 @@ export default function App() {
               ) : (
                 (() => {
                   const display = stripThink(m.content);
-                  return display ? <Markdown content={display} /> : <ThinkingIndicator />;
+                  if (!display) return <ThinkingIndicator />;
+                  return (
+                    <>
+                      <Markdown content={display} />
+                      {/* Read aloud (pocket-tts). Hidden while this reply is still streaming. */}
+                      {!isStreamingThis && (
+                        <SpeakButton
+                          active={speakingIdx === i}
+                          downloading={ttsDownloading && speakingIdx === i}
+                          downloadPct={ttsDownloadPct}
+                          disabled={ttsDownloading && speakingIdx !== i}
+                          onClick={() => void speakMessage(i, m.content)}
+                        />
+                      )}
+                    </>
+                  );
                 })()
               )}
             </div>
@@ -1257,11 +1432,15 @@ function SettingsPanel({
   onSave,
   onRelease,
   busy,
+  ttsLoaded,
+  onReleaseVoice,
 }: {
   settings: Settings;
   onSave: (patch: Partial<Settings>) => void;
   onRelease: () => void;
   busy: boolean;
+  ttsLoaded: boolean;
+  onReleaseVoice: () => void;
 }) {
   const inputCls = 'rounded border border-zinc-300 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100';
   const maxCtx = Math.min(webllmModel(settings.webllmModel).maxCtx, MAX_CONTEXT_TOKENS);
@@ -1356,14 +1535,55 @@ function SettingsPanel({
         <span className="text-zinc-500 dark:text-zinc-400">Prefer on-screen content in answers (experimental)</span>
       </label>
 
-      <button
-        type="button"
-        disabled={busy}
-        onClick={onRelease}
-        className="rounded border border-zinc-300 bg-white px-2 py-1 hover:bg-zinc-50 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
-      >
-        Release model from memory
-      </button>
+      <label className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          checked={settings.ttsAutoRead}
+          onChange={(e) => onSave({ ttsAutoRead: e.target.checked })}
+        />
+        <span className="text-zinc-500 dark:text-zinc-400">Read replies aloud automatically</span>
+      </label>
+      <p className="-mt-1 text-[10px] text-zinc-400">
+        Runs on-device. Downloads a ~{TTS_DOWNLOAD_MB} MB voice once, on first use. Voice:{' '}
+        <a
+          href="https://huggingface.co/kyutai/pocket-tts"
+          target="_blank"
+          rel="noreferrer"
+          className="underline hover:text-zinc-600 dark:hover:text-zinc-300"
+        >
+          pocket-tts
+        </a>{' '}
+        by Kyutai, licensed{' '}
+        <a
+          href="https://creativecommons.org/licenses/by/4.0/"
+          target="_blank"
+          rel="noreferrer"
+          className="underline hover:text-zinc-600 dark:hover:text-zinc-300"
+        >
+          CC-BY-4.0
+        </a>
+        .
+      </p>
+
+      <div className="flex flex-col gap-2">
+        <button
+          type="button"
+          disabled={busy}
+          onClick={onRelease}
+          className="rounded border border-zinc-300 bg-white px-2 py-1 hover:bg-zinc-50 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
+        >
+          Release model from memory
+        </button>
+        {ttsLoaded && (
+          <button
+            type="button"
+            onClick={onReleaseVoice}
+            className="rounded border border-zinc-300 bg-white px-2 py-1 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
+          >
+            Release voice model from memory
+          </button>
+        )}
+      </div>
     </div>
   );
 }

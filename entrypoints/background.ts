@@ -24,8 +24,10 @@ async function ensureOffscreen() {
   if (await offscreen.hasDocument()) return;
   await offscreen.createDocument({
     url: OFFSCREEN_URL,
-    reasons: ['WORKERS'],
-    justification: 'Runs the local AI model so it stays loaded between uses.',
+    // WORKERS: hosts the WebLLM engine + ML/TTS workers. AUDIO_PLAYBACK: lets the document
+    // play synthesized speech (pocket-tts) without a foreground user gesture.
+    reasons: ['WORKERS', 'AUDIO_PLAYBACK'],
+    justification: 'Runs the local AI model so it stays loaded between uses, and plays synthesized speech.',
   });
 }
 

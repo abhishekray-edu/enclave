@@ -1,0 +1,114 @@
+[
+ {
+  "text": "Hello world.",
+  "ids": [
+   2994,
+   578,
+   263
+  ],
+  "decoded": "Hello world."
+ },
+ {
+  "text": "Great question. I will walk you through it step by step.",
+  "ids": [
+   2734,
+   606,
+   363,
+   263,
+   268,
+   377,
+   825,
+   270,
+   427,
+   460,
+   275,
+   1001,
+   378,
+   1001,
+   263
+  ],
+  "decoded": "Great question. I will walk you through it step by step."
+ },
+ {
+  "text": "The quick brown fox jumps over the lazy dog.",
+  "ids": [
+   364,
+   976,
+   3683,
+   521,
+   1923,
+   1609,
+   261,
+   408,
+   265,
+   697,
+   690,
+   327,
+   1497,
+   263
+  ],
+  "decoded": "The quick brown fox jumps over the lazy dog."
+ },
+ {
+  "text": "It's 2026 — TTS runs locally!",
+  "ids": [
+   333,
+   264,
+   261,
+   260,
+   365,
+   316,
+   365,
+   543,
+   260,
+   3133,
+   602,
+   854,
+   640,
+   791,
+   261,
+   1827,
+   323,
+   682
+  ],
+  "decoded": "It's 2026 — TTS runs locally!"
+ },
+ {
+  "text": "Enclave: nothing ever leaves your machine.",
+  "ids": [
+   2227,
+   1576,
+   314,
+   3244,
+   354,
+   344,
+   746,
+   1037,
+   261,
+   312,
+   260,
+   283,
+   2060,
+   263
+  ],
+  "decoded": "Enclave: nothing ever leaves your machine."
+ },
+ {
+  "text": "café naïve résumé",
+  "ids": [
+   331,
+   2250,
+   745,
+   913,
+   199,
+   179,
+   314,
+   670,
+   745,
+   261,
+   766,
+   745
+  ],
+  "decoded": "café naïve résumé"
+ }
+]

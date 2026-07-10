@@ -44,6 +44,7 @@
     "@mlc-ai/web-llm": "^0.2.84",
     "@mozilla/readability": "^0.6.0",
     "highlight.js": "^11.11.1",
+    "onnxruntime-web": "1.26.0-dev.20260416-b7804b056c",
     "js-tiktoken": "^1.0.21",
     "react": "^19.2.4",
     "react-dom": "^19.2.4",
