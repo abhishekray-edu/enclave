@@ -22,24 +22,38 @@ import {
   type WebllmPort,
 } from '@/lib/webllmClient';
 import { isLoadInterruption } from '@/lib/modelLoader';
-import { ttsLoad, ttsSpeak, ttsStop, ttsRelease, TTS_DOWNLOAD_MB } from '@/lib/ttsClient';
+import { ttsLoad, ttsSpeak, ttsSpeakStream, ttsStop, ttsRelease, TTS_DOWNLOAD_MB, type TtsStreamSession } from '@/lib/ttsClient';
+import { SentenceStream } from '@/lib/sentences';
 import {
   sttLoad,
   sttStartListening,
-  sttMute,
   sttRelease,
   micPermissionState,
   openMicPermissionPage,
-  STT_DOWNLOAD_MB,
   type SttSession,
+  type SttState,
 } from '@/lib/sttClient';
+import { isLikelyEcho } from '@/lib/echoFilter';
 import { voiceReducer, type VoiceState } from '@/lib/voiceReducer';
-import { buildMessages, pageBudgetTokens, estimateTokens, type BuiltPrompt } from '@/lib/prompt';
+import { buildMessages, pageBudgetTokens, estimateTokens, VOICE_REPLY_DIRECTIVE, type BuiltPrompt } from '@/lib/prompt';
 import { chunkPage } from '@/lib/chunking';
 import { summarizeChunks } from '@/lib/summarize';
 import { TASKS, extractTask, resolveTemperature, EXTRACTION_SCHEMAS, type TaskSpec, type ExtractionSchema } from '@/lib/tasks';
 import { Markdown } from './Markdown';
 import { Logo } from './Logo';
+import { SettingsPanel } from './SettingsPanel';
+import { HexSpinner } from './hex';
+import { OnboardingCard } from './OnboardingCard';
+import {
+  MicIcon,
+  HeadphonesIcon,
+  SettingsIcon,
+  FileTextIcon,
+  LockIcon,
+  PlayIcon,
+  StopIcon,
+  AlertTriangleIcon,
+} from './icons';
 import { applyTheme } from '@/lib/theme';
 import {
   DEFAULT_SETTINGS,
@@ -50,7 +64,6 @@ import {
   type PageContent,
   type PendingAction,
   type Settings,
-  type Theme,
 } from '@/lib/types';
 
 const PENDING_KEY = 'pendingAction';
@@ -66,6 +79,8 @@ const VOICE_STATE_LABEL: Record<VoiceState, string> = {
 /** Persists which models have an interrupted (resumable) download, so the paused state
  *  survives the panel being recreated on close/reopen. */
 const PAUSED_MODELS_KEY = 'pausedDownloads';
+/** Persisted onboarding preference: download the voice models with the LLM (default on). */
+const ONBOARD_VOICE_KEY = 'onboardVoicePref';
 const PAGE_CAPTURE_TIMEOUT_MS = 8_000;
 const FIRST_TOKEN_TIMEOUT_MS = 90_000;
 const NEXT_TOKEN_TIMEOUT_MS = 45_000;
@@ -203,7 +218,7 @@ function SpeakButton({
       title={active ? 'Stop reading' : `Read this reply aloud${!downloading ? ` (downloads a ~${TTS_DOWNLOAD_MB} MB voice on first use)` : ''}`}
       className="mt-2 inline-flex items-center gap-1 rounded border border-zinc-300 px-2 py-0.5 text-[11px] text-zinc-500 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800"
     >
-      <span aria-hidden="true">{active && !downloading ? '■' : '▶'}</span>
+      {active && !downloading ? <StopIcon size={11} /> : <PlayIcon size={11} />}
       {label}
     </button>
   );
@@ -308,6 +323,14 @@ export default function App() {
   const [modelStatus, setModelStatus] = useState<'idle' | 'needs-download' | 'downloading' | 'loading' | 'ready'>('idle');
   /** Error surfaced inside the first-run card (download failures). */
   const [onboardError, setOnboardError] = useState<string | null>(null);
+  // Onboarding voice opt-in: download STT + TTS alongside the LLM so the record button works
+  // instantly. `onboardVoice` (persisted) is the checkbox; the init errors + micGranted drive the
+  // per-item rows and the mic-permission step in the card.
+  const [onboardVoice, setOnboardVoice] = useState(true);
+  const onboardVoiceRef = useRef(true);
+  const [sttInitError, setSttInitError] = useState<string | null>(null);
+  const [ttsInitError, setTtsInitError] = useState<string | null>(null);
+  const [micGranted, setMicGranted] = useState(false);
   /** Models whose download was interrupted (superseded by switching to another model) and
    *  is resumable. Their fetched weight shards stay cached, so re-downloading resumes. */
   const [pausedModels, setPausedModels] = useState<string[]>([]);
@@ -321,6 +344,19 @@ export default function App() {
   const ttsReadyRef = useRef(false);
   const ttsDownloadingRef = useRef(false);
   const speakingIdxRef = useRef<number | null>(null);
+  // Streamed speech: the active session while a reply is spoken sentence-by-sentence as it
+  // generates. `voiceReveal` gates how much of the reply's text is shown so it appears in step
+  // with the spoken audio (voice mode only). `spokenRef` retains recently spoken sentences for
+  // the barge-in echo filter.
+  const ttsStreamRef = useRef<TtsStreamSession | null>(null);
+  const [voiceReveal, setVoiceReveal] = useState<{ idx: number; end: number } | null>(null);
+  const revealMapRef = useRef<Map<number, number>>(new Map());
+  const spokenRef = useRef<{ plain: string; at: number }[]>([]);
+  // Barge-in: `bargeInRef` is set when the user talks over a reply (so the aborting turn doesn't
+  // resume the idle loop); `pendingVoiceTranscriptRef` holds a transcript that arrived while the
+  // prior generation was still unwinding, consumed as the next turn in submit's finally.
+  const bargeInRef = useRef(false);
+  const pendingVoiceTranscriptRef = useRef<string | null>(null);
   // Voice input (Moonshine STT + Silero VAD). The speech model downloads once on first use.
   // `voiceState` drives the hands-free loop (off → listening → speech → transcribing → thinking
   // → speaking → listening); `pttActive` is the separate push-to-talk mic button.
@@ -354,6 +390,7 @@ export default function App() {
   const messagesRef = useRef(messages);
   settingsRef.current = settings;
   messagesRef.current = messages;
+  onboardVoiceRef.current = onboardVoice;
   // Gate persisting paused models until the stored value has been loaded, so the initial
   // empty state never overwrites what's on disk.
   const pausedHydratedRef = useRef(false);
@@ -398,6 +435,18 @@ export default function App() {
         setPausedModels(paused.filter((id): id is string => typeof id === 'string'));
       }
       pausedHydratedRef.current = true;
+
+      // Onboarding voice preference + current mic permission (drives the first-run voice section).
+      const voiceStored = await browser.storage.local.get(ONBOARD_VOICE_KEY);
+      if (typeof voiceStored[ONBOARD_VOICE_KEY] === 'boolean') {
+        setOnboardVoice(voiceStored[ONBOARD_VOICE_KEY]);
+        onboardVoiceRef.current = voiceStored[ONBOARD_VOICE_KEY];
+      }
+      try {
+        if ((await micPermissionState()) === 'granted') setMicGranted(true);
+      } catch {
+        /* permissions API unavailable — the mic step just falls back to first-use prompt */
+      }
 
       const stored = await browser.storage.local.get(PENDING_KEY);
       const pending = stored[PENDING_KEY] as PendingAction | undefined;
@@ -537,6 +586,9 @@ export default function App() {
         throw new Error('This browser has no WebGPU. Use a recent Chromium browser (Chrome, Edge, or Brave).');
       }
       const port = await getWebllmPort();
+      // Voice models download in parallel (independent request-id spaces → separate workers), so
+      // the record button is warm the moment onboarding finishes. Best-effort; never blocks chat.
+      if (onboardVoiceRef.current) void startVoiceOnboarding(port);
       if (engineOpCurrent(epoch)) setModelStatus('downloading');
       await initModel(port, s.webllmModel, contextForSettings(s), (p) => {
         if (engineOpCurrent(epoch)) setLoadProgress(p);
@@ -551,6 +603,62 @@ export default function App() {
     } finally {
       if (engineOpCurrent(epoch)) setLoadProgress(null);
       endEngineOp(epoch);
+    }
+  }
+
+  /** Persist the onboarding voice preference and reflect it in the ref. */
+  function toggleOnboardVoice(enabled: boolean) {
+    setOnboardVoice(enabled);
+    onboardVoiceRef.current = enabled;
+    void browser.storage.local.set({ [ONBOARD_VOICE_KEY]: enabled });
+  }
+
+  /** Download + load the speech-recognition model for onboarding (errors shown inline in the
+   *  card, not the runtime strip). No-op if already loaded. */
+  async function downloadSttOnboard(port: WebllmPort) {
+    if (sttReadyRef.current) return;
+    setSttInitError(null);
+    setSttDownloading(true);
+    setSttDownloadPct(0);
+    try {
+      await sttLoad(port, (p) => setSttDownloadPct(Math.round(p * 100)));
+      sttReadyRef.current = true;
+      setSttReady(true);
+    } catch (e) {
+      setSttInitError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSttDownloading(false);
+    }
+  }
+
+  /** Download + load the TTS voice for onboarding (errors shown inline in the card). */
+  async function downloadTtsOnboard(port: WebllmPort) {
+    if (ttsReadyRef.current) return;
+    setTtsInitError(null);
+    setTtsDownloading(true);
+    ttsDownloadingRef.current = true;
+    setTtsDownloadPct(0);
+    try {
+      await ttsLoad(port, (p) => setTtsDownloadPct(Math.round(p * 100)));
+      ttsReadyRef.current = true;
+      setTtsReady(true);
+    } catch (e) {
+      setTtsInitError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTtsDownloading(false);
+      ttsDownloadingRef.current = false;
+    }
+  }
+
+  /** Kick off both speech-model downloads in parallel with the LLM download, then surface the
+   *  mic-permission step once they're ready. Best-effort — a failed item shows Retry and never
+   *  blocks the chat. */
+  async function startVoiceOnboarding(port: WebllmPort) {
+    await Promise.allSettled([downloadSttOnboard(port), downloadTtsOnboard(port)]);
+    try {
+      if ((await micPermissionState()) === 'granted') setMicGranted(true);
+    } catch {
+      /* ignore — first voice use will prompt */
     }
   }
 
@@ -681,16 +789,28 @@ export default function App() {
     });
   }
 
+  /** Replace the streaming assistant slot with an error notice (rendered with a warning icon). */
+  function setLastAssistantError(message: string) {
+    setMessages((prev) => {
+      const copy = [...prev];
+      copy[copy.length - 1] = { role: 'assistant', content: message, error: true };
+      return copy;
+    });
+  }
+
   function onChatScroll() {
     const el = scrollRef.current;
     if (el) shouldAutoScrollRef.current = isNearBottom(el);
   }
 
-  /** Stop any in-flight speech. */
+  /** Stop any in-flight speech (streamed session or one-shot). */
   function stopSpeaking() {
+    ttsStreamRef.current?.cancel();
+    ttsStreamRef.current = null;
     if (portRef.current) ttsStop(portRef.current);
     setSpeakingIdx(null);
     speakingIdxRef.current = null;
+    setVoiceReveal(null);
   }
 
   /** Read message `idx` aloud. First call downloads the ~178 MB voice model (once). Clicking
@@ -713,21 +833,12 @@ export default function App() {
     speakingIdxRef.current = idx;
 
     if (!ttsReadyRef.current) {
-      setTtsDownloading(true);
-      ttsDownloadingRef.current = true;
-      setTtsDownloadPct(0);
-      try {
-        await ttsLoad(port, (p) => setTtsDownloadPct(Math.round(p * 100)));
-        ttsReadyRef.current = true;
-        setTtsReady(true);
-      } catch (e) {
-        setTtsError(e instanceof Error ? e.message : String(e));
-        setSpeakingIdx(null);
-        speakingIdxRef.current = null;
+      if (!(await ensureTtsReady(port))) {
+        if (speakingIdxRef.current === idx) {
+          setSpeakingIdx(null);
+          speakingIdxRef.current = null;
+        }
         return;
-      } finally {
-        setTtsDownloading(false);
-        ttsDownloadingRef.current = false;
       }
     }
     // The user may have stopped/switched during the download.
@@ -742,6 +853,26 @@ export default function App() {
         setSpeakingIdx(null);
         speakingIdxRef.current = null;
       }
+    }
+  }
+
+  /** Ensure the voice (TTS) model is downloaded (once) and loaded. Mirrors ensureSttReady. */
+  async function ensureTtsReady(port: WebllmPort): Promise<boolean> {
+    if (ttsReadyRef.current) return true;
+    setTtsDownloading(true);
+    ttsDownloadingRef.current = true;
+    setTtsDownloadPct(0);
+    try {
+      await ttsLoad(port, (p) => setTtsDownloadPct(Math.round(p * 100)));
+      ttsReadyRef.current = true;
+      setTtsReady(true);
+      return true;
+    } catch (e) {
+      setTtsError(e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      setTtsDownloading(false);
+      ttsDownloadingRef.current = false;
     }
   }
 
@@ -872,26 +1003,13 @@ export default function App() {
       const port = await getWebllmPort();
       if (!(await ensureSttReady(port))) return;
       // The loop reads replies aloud, so make sure the TTS voice is loaded too.
-      if (!ttsReadyRef.current) {
-        setTtsDownloading(true);
-        ttsDownloadingRef.current = true;
-        setTtsDownloadPct(0);
-        try {
-          await ttsLoad(port, (p) => setTtsDownloadPct(Math.round(p * 100)));
-          ttsReadyRef.current = true;
-          setTtsReady(true);
-        } catch (e) {
-          setVoiceError(e instanceof Error ? e.message : String(e));
-          return;
-        } finally {
-          setTtsDownloading(false);
-          ttsDownloadingRef.current = false;
-        }
-      }
+      if (!(await ensureTtsReady(port))) return;
       setVoice('listening');
       voiceSessionRef.current = sttStartListening(port, {
         mode: 'auto',
-        onState: (s) => dispatchVoice({ type: 'sttState', state: s }),
+        pauseMs: settingsRef.current.voicePauseMs,
+        bargeIn: true,
+        onState: (s) => onVoiceStateUpdate(s),
         onTranscript: (text) => void onVoiceTranscript(text),
         onError: (e) => setVoiceError(e.message),
         onStopped: () => {
@@ -909,19 +1027,51 @@ export default function App() {
     setVoice('off');
     voiceSessionRef.current?.stop();
     voiceSessionRef.current = null;
+    bargeInRef.current = false;
+    pendingVoiceTranscriptRef.current = null;
     stopSpeaking();
   }
 
-  /** A hands-free utterance was transcribed: mute the mic (echo guard) and send it to the LLM.
-   *  submit() drives the reply back to 'speaking' → 'listening'. */
+  /** A status update from the STT worker. Full-duplex barge-in: if the user starts talking while
+   *  the assistant is thinking or speaking, stop the reply and let the transcript flow take over. */
+  function onVoiceStateUpdate(s: SttState) {
+    const cur = voiceStateRef.current;
+    if (s === 'speech' && (cur === 'thinking' || cur === 'speaking')) {
+      bargeInRef.current = true;
+      dispatchVoice({ type: 'bargeIn' }); // → speech
+      stopSpeaking(); // halt TTS playback immediately
+      abortRef.current?.abort(); // and cut generation if it's still running
+      return;
+    }
+    dispatchVoice({ type: 'sttState', state: s });
+  }
+
+  /** A hands-free utterance was transcribed → send it to the LLM. submit() drives the reply back
+   *  to 'speaking' → 'listening'. */
   async function onVoiceTranscript(text: string) {
-    if (voiceStateRef.current === 'off' || abortRef.current) return;
+    if (voiceStateRef.current === 'off') return;
     const t = text.trim();
     if (!t) {
+      bargeInRef.current = false;
       dispatchVoice({ type: 'resume' });
       return;
     }
-    if (portRef.current) sttMute(portRef.current, true);
+    // Barge-in echo guard: a transcript that closely matches what TTS just spoke is the
+    // assistant's own voice bleeding into the mic — discard it and keep listening.
+    const now = Date.now();
+    const recentSpoken = spokenRef.current.filter((x) => now - x.at < 10_000).map((x) => x.plain);
+    if (recentSpoken.length && isLikelyEcho(t, recentSpoken)) {
+      bargeInRef.current = false;
+      dispatchVoice({ type: 'resume' });
+      return;
+    }
+    // A prior generation may still be unwinding after a barge-in abort — submit() would reject
+    // while abortRef is set, so stash it and let submit's finally re-submit.
+    if (abortRef.current) {
+      pendingVoiceTranscriptRef.current = t;
+      return;
+    }
+    bargeInRef.current = false;
     dispatchVoice({ type: 'transcript' }); // → thinking
     await submit(t, { fromVoice: true });
   }
@@ -940,7 +1090,7 @@ export default function App() {
 
   function resumeVoiceListening() {
     if (voiceStateRef.current === 'off') return;
-    if (portRef.current) sttMute(portRef.current, false);
+    setVoiceReveal(null); // reply is done — show its full text
     dispatchVoice({ type: 'resume' }); // → listening
   }
 
@@ -952,6 +1102,8 @@ export default function App() {
     setVoice('off');
     sttReadyRef.current = false;
     setSttReady(false);
+    bargeInRef.current = false;
+    pendingVoiceTranscriptRef.current = null;
   }
 
   /** Free the speech model from memory (Settings). Next voice use reloads it. */
@@ -992,6 +1144,9 @@ export default function App() {
     // In hands-free voice mode we speak this reply ourselves (forced) and resume listening — so
     // capture the final text here instead of letting autoRead speak it on the ttsAutoRead setting.
     let voiceReplyText: string | null = null;
+    // When set, this reply was spoken by a streamed TTS session (sentence-by-sentence as it
+    // generated); the finally block awaits its playback instead of speaking the whole text again.
+    let streamSession: TtsStreamSession | null = null;
     shouldAutoScrollRef.current = true;
     setMessages([...conversation, { role: 'assistant', content: '' }]);
     setInput('');
@@ -1009,7 +1164,12 @@ export default function App() {
       }
       const runtimeCtx = contextForSettings(s);
       const model = webllmModel(s.webllmModel);
-      const sysOverride = spec.systemPrompt || undefined;
+      // A voice request is read back by TTS, so switch the model to conversational, spoken-style
+      // output (no markdown/LaTeX/lists) by appending the voice directive to the system prompt.
+      const baseSys = spec.systemPrompt || undefined;
+      const sysOverride = opts?.fromVoice
+        ? `${baseSys ?? s.systemPrompt}\n\n${VOICE_REPLY_DIRECTIVE}`
+        : baseSys;
       // Page context toggled off: nothing from the tab is captured or sent — the prompt is
       // just the system scaffold plus the conversation.
       let page: PageContent | null = null;
@@ -1033,7 +1193,7 @@ export default function App() {
           page.selection = opts.selectionOverride;
         }
         setPageNote('Preparing page context…');
-        const budget = pageBudgetTokens(s, page, conversation, runtimeCtx, spec.systemPrompt || undefined);
+        const budget = pageBudgetTokens(s, page, conversation, runtimeCtx, sysOverride);
         // The body a single prompt may carry: the context-window budget, hard-capped per model.
         // Big models get SMALLER prompts — one oversized prefill on an integrated GPU can starve
         // the OS compositor and take down the whole session (see docs/large-page-handling.md).
@@ -1149,6 +1309,7 @@ export default function App() {
       const genOptions: GenerateOptions = {
         temperature: resolveTemperature(spec, s),
         maxTokens: spec.maxTokens,
+        frequencyPenalty: s.repetitionPenalty || undefined,
       };
       // Qwen3 models reason in hidden <think> blocks by default — the user just sees the
       // spinner while tokens they'll never read stream at decode speed. Hard-disable it for
@@ -1170,7 +1331,12 @@ export default function App() {
           o: { temperature: number; maxTokens: number; stream?: boolean },
         ): Promise<string> => {
           const rid = ++reqRef.current;
-          const ro: GenerateOptions = { temperature: o.temperature, maxTokens: o.maxTokens, enableThinking: qwen ? false : undefined };
+          const ro: GenerateOptions = {
+            temperature: o.temperature,
+            maxTokens: o.maxTokens,
+            enableThinking: qwen ? false : undefined,
+            frequencyPenalty: s.repetitionPenalty || undefined,
+          };
           if (o.stream) {
             const it = streamGenerate(port, rid, messages, ro, controller.signal)[Symbol.asyncIterator]();
             let acc = '';
@@ -1247,6 +1413,47 @@ export default function App() {
         streamIterator = streamGenerate(port, ++reqRef.current, built.messages, genOptions, controller.signal)[Symbol.asyncIterator]();
         let acc = '';
         let receivedToken = false;
+        // Speak the reply sentence-by-sentence AS it generates when the request is from voice or
+        // auto-read is on. The session opens lazily on the first complete sentence; sentences are
+        // segmented from the (think-stripped) accumulator so speech starts within a sentence or
+        // two instead of after the whole reply. For auto-read we only stream when the voice is
+        // already loaded — otherwise a first-use ~132 MB download would freeze the streaming text
+        // mid-reply; that case falls back to speaking the whole reply after it finishes.
+        const isVoiceMode = opts?.fromVoice === true;
+        const wantTts = isVoiceMode || (settingsRef.current.ttsAutoRead && ttsReadyRef.current);
+        const sentences = new SentenceStream();
+        // In voice mode, hide the reply text from the start so it reveals in step with speech
+        // (rather than flashing the first sentence before its audio is ready).
+        if (isVoiceMode) setVoiceReveal({ idx: assistantIdx, end: 0 });
+
+        const openStreamSession = async (): Promise<TtsStreamSession | null> => {
+          if (!(await ensureTtsReady(port))) return null;
+          const session = ttsSpeakStream(port);
+          revealMapRef.current = new Map();
+          spokenRef.current = [];
+          session.onChunkStarted((seq) => {
+            const end = revealMapRef.current.get(seq);
+            if (end != null && isVoiceMode) setVoiceReveal({ idx: assistantIdx, end });
+          });
+          session.onError((err) => setTtsError(err.message));
+          ttsStreamRef.current = session;
+          setSpeakingIdx(assistantIdx);
+          speakingIdxRef.current = assistantIdx;
+          if (isVoiceMode) {
+            dispatchVoice({ type: 'speak' });
+            setVoiceReveal({ idx: assistantIdx, end: 0 }); // hide text until the first spoken sentence
+          }
+          return session;
+        };
+
+        const speakSentence = (session: TtsStreamSession, text: string, endOffset: number) => {
+          const plain = toPlainText(text);
+          if (!plain) return;
+          const seq = session.append(plain);
+          revealMapRef.current.set(seq, endOffset);
+          spokenRef.current.push({ plain, at: Date.now() });
+        };
+
         while (true) {
           const next = await withTimeout(
             streamIterator.next(),
@@ -1259,9 +1466,38 @@ export default function App() {
           receivedToken = true;
           acc += delta;
           setLastAssistant(acc);
+          if (wantTts && !controller.signal.aborted) {
+            for (const piece of sentences.push(stripThink(acc))) {
+              if (!streamSession) {
+                streamSession = await openStreamSession();
+                if (!streamSession) break;
+              }
+              speakSentence(streamSession, piece.text, piece.endOffset);
+            }
+          }
         }
+
+        if (streamSession && !controller.signal.aborted) {
+          const tail = sentences.flush();
+          if (tail) speakSentence(streamSession, tail.text, tail.endOffset);
+          streamSession.finish();
+        } else if (streamSession) {
+          streamSession.cancel();
+          streamSession = null;
+          ttsStreamRef.current = null;
+          setVoiceReveal(null);
+        }
+
         if (!acc) setLastAssistant(controller.signal.aborted ? '_(stopped)_' : '_(no response)_');
-        else if (!controller.signal.aborted) {
+        else if (controller.signal.aborted) {
+          // Barge-in kept the partial reply in the thread (and thus in context) so the follow-up
+          // turn can build on it; a plain Stop just leaves the partial as-is.
+          if (bargeInRef.current) setLastAssistant(acc + '\n\n_(interrupted)_');
+        } else if (!streamSession) {
+          // Nothing was streamed to TTS (e.g. a short single-sentence voice reply, or auto-read
+          // off and not a voice turn) — fall back to the whole-reply paths and show the full text
+          // (there's no sentence-level reveal to sync to here).
+          if (isVoiceMode) setVoiceReveal(null);
           if (opts?.fromVoice) voiceReplyText = acc;
           else autoRead(assistantIdx, acc);
         }
@@ -1276,7 +1512,15 @@ export default function App() {
       }
       // A load canceled by Stop or displaced by a model switch reads as "stopped", not a crash.
       const userStopped = (e instanceof DOMException && e.name === 'AbortError') || isLoadInterruption(e);
-      setLastAssistant(userStopped ? '_(stopped)_' : `⚠️ ${e instanceof Error ? e.message : String(e)}`);
+      if (userStopped) setLastAssistant('_(stopped)_');
+      else setLastAssistantError(e instanceof Error ? e.message : String(e));
+      // A streamed speech session for this reply is now orphaned — stop it.
+      if (streamSession) {
+        streamSession.cancel();
+        streamSession = null;
+        ttsStreamRef.current = null;
+        setVoiceReveal(null);
+      }
       // If the model never finished loading, its true state (cached? downloaded?) is
       // unknown here — re-derive the status instead of leaving a stale "Loading…".
       if (!modelReady) schedulePreload(settingsRef.current);
@@ -1286,8 +1530,34 @@ export default function App() {
       setPageNote(null);
       abortRef.current = null;
       endEngineOp(epoch);
-      // Hands-free loop: speak the reply (or just resume) — never leave it stuck in 'thinking'.
-      if (opts?.fromVoice) handleVoiceReply(assistantIdx, voiceReplyText);
+      // A barge-in captured a new utterance while this reply was in flight — send it as the next
+      // turn instead of resuming the idle loop.
+      const pending = pendingVoiceTranscriptRef.current;
+      if (pending != null && voiceStateRef.current !== 'off') {
+        pendingVoiceTranscriptRef.current = null;
+        bargeInRef.current = false;
+        dispatchVoice({ type: 'transcript' }); // → thinking
+        void submit(pending, { fromVoice: true });
+      } else if (streamSession) {
+        // The reply was streamed to TTS sentence-by-sentence and its audio is still playing; wait
+        // for it to finish before clearing the speaking marker / resuming the listening loop.
+        const session = streamSession;
+        const fromVoice = opts?.fromVoice === true;
+        void session.ended.then(() => {
+          if (ttsStreamRef.current === session) ttsStreamRef.current = null;
+          if (speakingIdxRef.current === assistantIdx) {
+            setSpeakingIdx(null);
+            speakingIdxRef.current = null;
+          }
+          setVoiceReveal(null);
+          // A barge-in is mid-flight (its transcript hasn't arrived yet) — don't resume; the
+          // incoming transcript owns the next turn.
+          if (fromVoice && !bargeInRef.current) resumeVoiceListening();
+        });
+      } else if (opts?.fromVoice && !bargeInRef.current) {
+        // Hands-free loop: speak the reply (or just resume) — never leave it stuck in 'thinking'.
+        handleVoiceReply(assistantIdx, voiceReplyText);
+      }
     }
   }
 
@@ -1370,11 +1640,13 @@ export default function App() {
           })}
         </select>
         <button
-          className="rounded px-2 py-1 text-xs text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+          className="flex items-center justify-center rounded p-1.5 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
           onClick={() => setShowSettings((v) => !v)}
           title="Settings"
+          aria-label="Settings"
+          aria-pressed={showSettings}
         >
-          ⚙
+          <SettingsIcon size={17} />
         </button>
       </header>
 
@@ -1479,11 +1751,20 @@ export default function App() {
                 m.content
               ) : isPlaceholder ? (
                 <ThinkingIndicator />
+              ) : m.error ? (
+                <div className="flex items-start gap-1.5 text-amber-700 dark:text-amber-400">
+                  <AlertTriangleIcon size={15} className="mt-0.5 shrink-0" />
+                  <span className="text-sm">{m.content}</span>
+                </div>
               ) : m.structured ? (
                 <StructuredResult data={m.structured.data} raw={m.content} />
               ) : (
                 (() => {
-                  const display = stripThink(m.content);
+                  const full = stripThink(m.content);
+                  // In voice mode, reveal only up to the sentence currently being spoken so the
+                  // shown text tracks the audio. Non-voice (incl. auto-read) shows the full reply.
+                  const reveal = voiceReveal && voiceReveal.idx === i ? voiceReveal.end : null;
+                  const display = reveal != null && reveal < full.length ? full.slice(0, reveal) : full;
                   if (!display) return <ThinkingIndicator />;
                   return (
                     <>
@@ -1513,8 +1794,16 @@ export default function App() {
             busy={modelStatus === 'downloading'}
             progress={loadProgress}
             error={onboardError}
+            voiceEnabled={onboardVoice}
+            stt={{ downloading: sttDownloading, pct: sttDownloadPct, ready: sttReady, error: sttInitError }}
+            tts={{ downloading: ttsDownloading, pct: ttsDownloadPct, ready: ttsReady, error: ttsInitError }}
+            micNeeded={onboardVoice && sttReady && ttsReady && !micGranted}
             onSelect={(id) => void onSaveSettings({ webllmModel: id })}
             onDownload={() => void downloadModel()}
+            onToggleVoice={toggleOnboardVoice}
+            onRetryStt={() => void getWebllmPort().then(downloadSttOnboard)}
+            onRetryTts={() => void getWebllmPort().then(downloadTtsOnboard)}
+            onAllowMic={() => void ensureMicPermission().then((ok) => ok && setMicGranted(true))}
           />
         )}
       </div>
@@ -1563,7 +1852,7 @@ export default function App() {
         <button
           type="button"
           className={
-            'ml-auto rounded-full border px-3 py-1 text-xs disabled:opacity-40 ' +
+            'ml-auto inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs disabled:opacity-40 ' +
             (settings.pageContext
               ? 'border-indigo-300 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 dark:border-indigo-500/50 dark:bg-indigo-500/15 dark:text-indigo-300 dark:hover:bg-indigo-500/25'
               : 'border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 dark:border-amber-500/50 dark:bg-amber-500/15 dark:text-amber-300 dark:hover:bg-amber-500/25')
@@ -1577,7 +1866,8 @@ export default function App() {
           }
           onClick={() => void onSaveSettings({ pageContext: !settings.pageContext })}
         >
-          {settings.pageContext ? '📄 Page: on' : '🔒 Page: off'}
+          {settings.pageContext ? <FileTextIcon size={13} /> : <LockIcon size={13} />}
+          {settings.pageContext ? 'Page: on' : 'Page: off'}
         </button>
       </div>
 
@@ -1611,13 +1901,19 @@ export default function App() {
           title={pttActive ? 'Stop recording' : 'Push to talk — record a message'}
           aria-label={pttActive ? 'Stop recording' : 'Push to talk'}
           className={
-            'rounded px-3 py-2 text-sm tabular-nums ' +
+            'flex items-center justify-center rounded px-3 py-2 text-sm tabular-nums ' +
             (pttActive
               ? 'bg-red-600 text-white hover:bg-red-500'
               : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300 disabled:opacity-40 dark:bg-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-600')
           }
         >
-          {voiceLoading === 'ptt' ? (sttDownloading ? `${sttDownloadPct}%` : '…') : pttActive ? '■' : '🎤'}
+          {voiceLoading === 'ptt' ? (
+            sttDownloading ? `${sttDownloadPct}%` : '…'
+          ) : pttActive ? (
+            <StopIcon size={16} />
+          ) : (
+            <MicIcon size={16} />
+          )}
         </button>
         {/* Hands-free voice mode */}
         <button
@@ -1630,19 +1926,17 @@ export default function App() {
           aria-label="Toggle hands-free voice mode"
           aria-pressed={voiceState !== 'off'}
           className={
-            'rounded px-3 py-2 text-sm tabular-nums ' +
+            'flex items-center justify-center rounded px-3 py-2 text-sm tabular-nums ' +
             (voiceState !== 'off'
               ? 'bg-indigo-600 text-white hover:bg-indigo-500'
               : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300 disabled:opacity-40 dark:bg-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-600')
           }
         >
-          {voiceLoading === 'voice'
-            ? sttDownloading
-              ? `${sttDownloadPct}%`
-              : ttsDownloading
-                ? `${ttsDownloadPct}%`
-                : '…'
-            : '🎧'}
+          {voiceLoading === 'voice' ? (
+            sttDownloading ? `${sttDownloadPct}%` : ttsDownloading ? `${ttsDownloadPct}%` : '…'
+          ) : (
+            <HeadphonesIcon size={16} />
+          )}
         </button>
         {streaming ? (
           <button
@@ -1658,383 +1952,6 @@ export default function App() {
             onClick={() => submit(input)}
           >
             Send
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** Geometry shared by the animated logo states (matches Logo.tsx / public/logo.svg). */
-const HEX_POINTS = '64,8 114,36 114,92 64,120 14,92 14,36';
-const SPARK_PATH =
-  'M64 36 C65.5 50 78 62.5 92 64 C78 65.5 65.5 78 64 92 C62.5 78 50 65.5 36 64 C50 62.5 62.5 50 64 36 Z';
-
-/** The Enclave hexagon, stroke-drawn once when the first-run card mounts ("sealing the
- *  enclave"), with the spark fading in after. Static under prefers-reduced-motion. */
-function HexDraw() {
-  return (
-    <svg width={44} height={44} viewBox="0 0 128 128" fill="none" aria-hidden="true">
-      <polygon
-        className="onboard-hex text-zinc-400 dark:text-zinc-500"
-        points={HEX_POINTS}
-        pathLength={1}
-        stroke="currentColor"
-        strokeWidth="6"
-        strokeLinejoin="round"
-      />
-      <path className="onboard-spark text-zinc-800 dark:text-zinc-200" d={SPARK_PATH} fill="currentColor" />
-    </svg>
-  );
-}
-
-/** Enclave-branded loader: a dash orbits the hexagon while the spark breathes. Shown while
- *  model weights load from the local cache onto the GPU. Static under prefers-reduced-motion. */
-function HexSpinner({ label }: { label: string }) {
-  return (
-    <div className="flex flex-col items-center gap-2" role="status" aria-label={label}>
-      <svg width={40} height={40} viewBox="0 0 128 128" fill="none" aria-hidden="true">
-        <polygon
-          className="text-zinc-200 dark:text-zinc-700"
-          points={HEX_POINTS}
-          stroke="currentColor"
-          strokeWidth="6"
-          strokeLinejoin="round"
-        />
-        <polygon
-          className="hex-spinner-dash text-zinc-700 dark:text-zinc-300"
-          points={HEX_POINTS}
-          pathLength={1}
-          stroke="currentColor"
-          strokeWidth="6"
-          strokeLinejoin="round"
-          strokeLinecap="round"
-        />
-        <path className="hex-spinner-spark text-zinc-800 dark:text-zinc-200" d={SPARK_PATH} fill="currentColor" />
-      </svg>
-      <span className="text-[11px] text-zinc-400 dark:text-zinc-500">{label}</span>
-    </div>
-  );
-}
-
-/** First-run setup: pick a model (one row is suggested from the device's reported memory)
- *  and download it explicitly — nothing downloads until the button or a question says so. */
-function OnboardingCard({
-  settings,
-  suggestedId,
-  pausedModels,
-  busy,
-  progress,
-  error,
-  onSelect,
-  onDownload,
-}: {
-  settings: Settings;
-  suggestedId: string;
-  pausedModels: string[];
-  busy: boolean;
-  progress: LoadProgress | null;
-  error: string | null;
-  onSelect: (id: string) => void;
-  onDownload: () => void;
-}) {
-  const current = webllmModel(settings.webllmModel);
-  const pct = Math.round((progress?.progress ?? 0) * 100);
-  // The selected model has a partial download to pick up where it left off.
-  const resumable = pausedModels.includes(settings.webllmModel);
-  return (
-    <div className="onboard mx-auto mt-4 max-w-[21rem] rounded-xl border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-700 dark:bg-zinc-800">
-      <div className="flex flex-col items-center text-center">
-        <HexDraw />
-        <h2 className="mt-2 text-sm font-semibold tracking-tight">Pick your model</h2>
-      </div>
-
-      <fieldset className="mt-3 space-y-1.5" disabled={busy}>
-        <legend className="sr-only">Model</legend>
-        {WEBLLM_MODELS.map((m) => {
-          const selected = m.id === settings.webllmModel;
-          return (
-            <label
-              key={m.id}
-              className={
-                'flex cursor-pointer items-center gap-2 rounded-lg border px-2.5 py-1.5 transition-colors ' +
-                (selected
-                  ? 'border-zinc-800 bg-zinc-50 dark:border-zinc-300 dark:bg-zinc-900/40'
-                  : 'border-zinc-200 hover:bg-zinc-50 dark:border-zinc-700 dark:hover:bg-zinc-700/40')
-              }
-            >
-              <input
-                type="radio"
-                name="onboard-model"
-                className="peer sr-only"
-                checked={selected}
-                onChange={() => onSelect(m.id)}
-              />
-              <span
-                aria-hidden="true"
-                className={
-                  'h-3 w-3 shrink-0 rounded-full border-2 peer-focus-visible:ring-2 peer-focus-visible:ring-zinc-400 ' +
-                  (selected
-                    ? 'border-zinc-800 bg-zinc-800 dark:border-zinc-200 dark:bg-zinc-200'
-                    : 'border-zinc-300 dark:border-zinc-600')
-                }
-              />
-              <span className="flex min-w-0 flex-1 items-baseline gap-1.5 text-xs">
-                <span className="font-medium">{m.label}</span>
-                <span className="truncate text-[10px] text-zinc-400">{m.note}</span>
-                {m.id === suggestedId && (
-                  <span className="shrink-0 rounded-full bg-emerald-50 px-1.5 py-px text-[9px] font-medium text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-300">
-                    Suggested
-                  </span>
-                )}
-                {pausedModels.includes(m.id) && !selected && (
-                  <span className="shrink-0 rounded-full bg-amber-50 px-1.5 py-px text-[9px] font-medium text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
-                    Paused
-                  </span>
-                )}
-              </span>
-              <span className="shrink-0 text-[10px] tabular-nums text-zinc-400">~{m.approxGb} GB</span>
-            </label>
-          );
-        })}
-      </fieldset>
-
-      <button
-        onClick={onDownload}
-        disabled={busy}
-        className={
-          'relative mt-3 w-full overflow-hidden rounded-lg px-3 py-2 text-sm font-medium ' +
-          (busy
-            ? 'cursor-default bg-zinc-100 text-zinc-800 dark:bg-zinc-700 dark:text-zinc-100'
-            : 'bg-zinc-900 text-white hover:bg-zinc-800 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-300')
-        }
-      >
-        {/* The button is the progress bar: an emerald fill sweeps it left to right — the
-            same green as the "Ready to chat" badge it resolves into. */}
-        {busy && (
-          <span
-            aria-hidden="true"
-            className="absolute inset-y-0 left-0 bg-emerald-100 transition-[width] duration-300 dark:bg-emerald-800"
-            style={{ width: `${pct}%` }}
-          />
-        )}
-        <span className="relative">
-          {busy
-            ? `Downloading… ${pct}%`
-            : `${resumable ? 'Resume download' : 'Download'} ${current.label} · ~${current.approxGb} GB`}
-        </span>
-      </button>
-
-      {error && !busy && (
-        <p className="mt-1.5 text-center text-[11px] text-amber-700 dark:text-amber-400">{error}</p>
-      )}
-      <p className="mt-2 text-center text-[11px] text-zinc-500 dark:text-zinc-400">
-        Download once. Run on your GPU. Forever free.
-      </p>
-    </div>
-  );
-}
-
-function SettingsPanel({
-  settings,
-  onSave,
-  onRelease,
-  busy,
-  ttsLoaded,
-  onReleaseVoice,
-  sttLoaded,
-  onReleaseVoiceInput,
-}: {
-  settings: Settings;
-  onSave: (patch: Partial<Settings>) => void;
-  onRelease: () => void;
-  busy: boolean;
-  ttsLoaded: boolean;
-  onReleaseVoice: () => void;
-  sttLoaded: boolean;
-  onReleaseVoiceInput: () => void;
-}) {
-  const inputCls = 'rounded border border-zinc-300 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100';
-  const maxCtx = Math.min(webllmModel(settings.webllmModel).maxCtx, MAX_CONTEXT_TOKENS);
-  return (
-    <div className="space-y-3 border-b border-zinc-200 bg-zinc-100 px-3 py-3 text-xs dark:border-zinc-800 dark:bg-zinc-900">
-      <label className="block">
-        <span className="text-zinc-500 dark:text-zinc-400">Theme</span>
-        <div className="mt-1 inline-flex overflow-hidden rounded border border-zinc-300 dark:border-zinc-700">
-          {(['system', 'light', 'dark'] as Theme[]).map((t) => (
-            <button
-              key={t}
-              className={
-                'px-2.5 py-1 capitalize ' +
-                (settings.theme === t
-                  ? 'bg-zinc-800 text-white dark:bg-zinc-600'
-                  : 'bg-white hover:bg-zinc-50 dark:bg-zinc-800 dark:hover:bg-zinc-700')
-              }
-              onClick={() => onSave({ theme: t })}
-            >
-              {t}
-            </button>
-          ))}
-        </div>
-      </label>
-
-      <label className="block">
-        <span className="text-zinc-500 dark:text-zinc-400">Model</span>
-        <select
-          className={`mt-1 w-full ${inputCls}`}
-          value={settings.webllmModel}
-          onChange={(e) => onSave({ webllmModel: e.target.value })}
-        >
-          {WEBLLM_MODELS.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.label} · ~{m.approxGb} GB · {m.note}
-            </option>
-          ))}
-        </select>
-        <p className="mt-1 text-[10px] text-zinc-400">
-          Larger models give better answers but need more GPU memory (and a bigger one-time download). Each is cached after first use.
-        </p>
-      </label>
-
-      <label className="block">
-        <span className="text-zinc-500 dark:text-zinc-400">Context (tokens)</span>
-        <input
-          type="number"
-          className={`mt-1 w-full ${inputCls}`}
-          value={settings.webllmCtx}
-          min={MIN_CONTEXT_TOKENS}
-          max={maxCtx}
-          step={MIN_CONTEXT_TOKENS}
-          onChange={(e) => {
-            const value = Number(e.target.value);
-            if (!Number.isFinite(value)) return;
-            onSave({
-              webllmCtx: Math.max(MIN_CONTEXT_TOKENS, Math.min(maxCtx, value || DEFAULT_SETTINGS.webllmCtx)),
-            });
-          }}
-        />
-        <p className="mt-1 text-[10px] text-zinc-400">
-          Higher reads more of the page but reserves more GPU memory up front. Enclave caps this at {maxCtx.toLocaleString()} for stability; changing it reloads the model.
-        </p>
-      </label>
-
-      <label className="block">
-        <span className="text-zinc-500 dark:text-zinc-400">Temperature</span>
-        <input
-          type="number"
-          className={`mt-1 w-full ${inputCls}`}
-          value={settings.temperature}
-          min={0}
-          max={1}
-          step={0.1}
-          onChange={(e) => onSave({ temperature: Number(e.target.value) })}
-        />
-      </label>
-
-      <label className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          checked={settings.compressContext}
-          onChange={(e) => onSave({ compressContext: e.target.checked })}
-        />
-        <span className="text-zinc-500 dark:text-zinc-400">Compress retrieved context (experimental)</span>
-      </label>
-
-      <label className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          checked={settings.viewportBoost}
-          onChange={(e) => onSave({ viewportBoost: e.target.checked })}
-        />
-        <span className="text-zinc-500 dark:text-zinc-400">Prefer on-screen content in answers (experimental)</span>
-      </label>
-
-      <label className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          checked={settings.ttsAutoRead}
-          onChange={(e) => onSave({ ttsAutoRead: e.target.checked })}
-        />
-        <span className="text-zinc-500 dark:text-zinc-400">Read replies aloud automatically</span>
-      </label>
-      <p className="-mt-1 text-[10px] text-zinc-400">
-        Runs on-device. Downloads a ~{TTS_DOWNLOAD_MB} MB voice once, on first use. Voice:{' '}
-        <a
-          href="https://huggingface.co/kyutai/pocket-tts"
-          target="_blank"
-          rel="noreferrer"
-          className="underline hover:text-zinc-600 dark:hover:text-zinc-300"
-        >
-          pocket-tts
-        </a>{' '}
-        by Kyutai, licensed{' '}
-        <a
-          href="https://creativecommons.org/licenses/by/4.0/"
-          target="_blank"
-          rel="noreferrer"
-          className="underline hover:text-zinc-600 dark:hover:text-zinc-300"
-        >
-          CC-BY-4.0
-        </a>
-        .
-      </p>
-
-      <label className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          checked={settings.voiceAutoSend}
-          onChange={(e) => onSave({ voiceAutoSend: e.target.checked })}
-        />
-        <span className="text-zinc-500 dark:text-zinc-400">Send push-to-talk messages automatically</span>
-      </label>
-      <p className="-mt-1 text-[10px] text-zinc-400">
-        Off: the mic (🎤) drops your words into the composer to edit first. On: it sends them right away. Hands-free
-        voice mode (🎧) always sends and reads replies back. Speech recognition runs on-device with{' '}
-        <a
-          href="https://huggingface.co/UsefulSensors/moonshine"
-          target="_blank"
-          rel="noreferrer"
-          className="underline hover:text-zinc-600 dark:hover:text-zinc-300"
-        >
-          Moonshine
-        </a>{' '}
-        (English, ~{STT_DOWNLOAD_MB} MB, downloaded once) and{' '}
-        <a
-          href="https://github.com/snakers4/silero-vad"
-          target="_blank"
-          rel="noreferrer"
-          className="underline hover:text-zinc-600 dark:hover:text-zinc-300"
-        >
-          Silero VAD
-        </a>
-        , both MIT-licensed.
-      </p>
-
-      <div className="flex flex-col gap-2">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={onRelease}
-          className="rounded border border-zinc-300 bg-white px-2 py-1 hover:bg-zinc-50 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
-        >
-          Release model from memory
-        </button>
-        {ttsLoaded && (
-          <button
-            type="button"
-            onClick={onReleaseVoice}
-            className="rounded border border-zinc-300 bg-white px-2 py-1 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
-          >
-            Release voice model from memory
-          </button>
-        )}
-        {sttLoaded && (
-          <button
-            type="button"
-            onClick={onReleaseVoiceInput}
-            className="rounded border border-zinc-300 bg-white px-2 py-1 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
-          >
-            Release voice-input model from memory
           </button>
         )}
       </div>

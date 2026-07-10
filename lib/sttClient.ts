@@ -46,6 +46,10 @@ export interface SttSession {
 
 export interface SttListenOptions {
   mode: 'ptt' | 'auto';
+  /** Hands-free silence (ms) before an utterance ends (VAD redemption window). Auto mode only. */
+  pauseMs?: number;
+  /** Keep the mic live during TTS playback so the user can interrupt (hands-free barge-in). */
+  bargeIn?: boolean;
   onState?: (state: SttState) => void;
   onTranscript: (text: string) => void;
   onError?: (err: Error) => void;
@@ -71,7 +75,13 @@ export function sttStartListening(port: WebllmPort, opts: SttListenOptions): Stt
   }
   port.onMessage.addListener(onMsg);
   port.onDisconnect.addListener(onDisc);
-  port.postMessage({ type: 'sttStart', id, mode: opts.mode } satisfies PanelToOffscreen);
+  port.postMessage({
+    type: 'sttStart',
+    id,
+    mode: opts.mode,
+    pauseMs: opts.pauseMs,
+    bargeIn: opts.bargeIn,
+  } satisfies PanelToOffscreen);
   return {
     id,
     stop(flush?: boolean) {

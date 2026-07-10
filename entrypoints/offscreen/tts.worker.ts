@@ -19,8 +19,11 @@ import { SpUnigramTokenizer } from '@/lib/spTokenizer';
 // ---- Message protocol (offscreen main.ts <-> this worker) ----
 interface LoadMsg { type: 'ttsLoad'; id: number }
 interface SpeakMsg { type: 'ttsSpeak'; id: number; text: string }
+interface SpeakStreamMsg { type: 'ttsSpeakStream'; id: number }
+interface AppendMsg { type: 'ttsAppend'; id: number; seq: number; text: string }
+interface FinishMsg { type: 'ttsFinish'; id: number }
 interface StopMsg { type: 'ttsStop' }
-type TtsWorkerRequest = LoadMsg | SpeakMsg | StopMsg;
+type TtsWorkerRequest = LoadMsg | SpeakMsg | SpeakStreamMsg | AppendMsg | FinishMsg | StopMsg;
 
 // ---- Assets (English, single CC-BY-4.0 "alba" voice) fetched once, then served from Cache
 //      Storage. Self-hosted in our OWN public HF repo (not a third-party Space) so availability
@@ -96,8 +99,23 @@ let maxTokenPerChunk = 50;
 
 let voiceState: State | null = null; // conditioned flow-LM state for the default voice
 let stTensors: { s: ort.Tensor; t: ort.Tensor }[] = [];
-let isGenerating = false;
 let isReady = false;
+
+// ---- Streaming session state ----
+// A session is opened by ttsSpeakStream, fed sentences via ttsAppend as the LLM produces them,
+// and closed by ttsFinish. speakLoop drains the queue in order; playback streams out as more
+// sentences arrive. Cancellation keys off sessionId (not a bare boolean) so a new session that
+// preempts an old one can never be revived by the old loop.
+let sessionId: number | null = null;
+let queue: { seq: number; text: string }[] = [];
+let finished = false;
+let waiter: (() => void) | null = null;
+
+function wakeWaiter() {
+  const w = waiter;
+  waiter = null;
+  w?.();
+}
 
 // ---- ORT setup: the 'onnxruntime-web/wasm' bundle build inlines its JS glue and Vite emits
 //      the .wasm into assets/, which ORT self-locates — so no wasmPaths is needed. Pin to a
@@ -400,120 +418,170 @@ async function load(id: number) {
   post({ type: 'ttsReady', id });
 }
 
-// ---- Generation loop (ported faithfully) ----
-async function speak(id: number, text: string) {
+// ---- Streaming session control ----
+/** Open a session and start draining it. Preempts any session already running. */
+function startSession(id: number) {
+  sessionId = id; // an old speakLoop keyed to a different id will see the mismatch and exit
+  queue = [];
+  finished = false;
+  wakeWaiter();
+  void speakLoop(id);
+}
+
+function appendToSession(id: number, seq: number, text: string) {
+  if (id !== sessionId) return; // a stale append for a preempted session
+  queue.push({ seq, text });
+  wakeWaiter();
+}
+
+function finishSession(id: number) {
+  if (id !== sessionId) return;
+  finished = true;
+  wakeWaiter();
+}
+
+/** Stop the current session immediately (main.ts's ttsStop handler emits ttsEnded itself, so we
+ *  deliberately do NOT post ttsSpeakDone here). */
+function stopSession() {
+  sessionId = null;
+  queue = [];
+  finished = true;
+  wakeWaiter();
+}
+
+/** Drain the session's sentence queue in order, generating and streaming audio as sentences
+ *  arrive. Posts ttsSpeakDone exactly once, only after the queue is drained AND finished — so
+ *  the panel's ttsEnded fires at the true end of the whole reply. */
+async function speakLoop(id: number) {
   if (!isReady || !flowLmMainSession || !flowLmFlowSession || !mimiDecoderSession || !textConditionerSession || !voiceState || !bundleMeta) {
     post({ type: 'ttsError', id, message: 'Voice model not loaded.' });
+    if (sessionId === id) sessionId = null;
     return;
   }
-  if (isGenerating) return;
-  isGenerating = true;
+  let firstAudio = true;
   try {
-    const { chunks, framesAfterEos } = splitIntoBestSentences(text);
-    if (!chunks.length) throw new Error('No text to speak');
-
-    let mimiState = initStateFromManifest(bundleMeta.mimi_state_manifest);
-    const emptySeq = tensor('float32', new Float32Array(0), [1, 0, latentDim]);
-    const emptyTextEmb = tensor('float32', new Float32Array(0), [1, 0, conditioningDim]);
-    const baseFlowState = voiceState;
-    let flowLmState = cloneState(baseFlowState);
-
-    const firstChunkFrames = 3;
-    const normalChunkFrames = 12;
-    let isFirstAudioChunk = true;
-
-    for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx++) {
-      if (!isGenerating) break;
-      if (RESET_FLOW_STATE_EACH_CHUNK && chunkIdx > 0) flowLmState = cloneState(baseFlowState);
-      if (RESET_MIMI_STATE_EACH_CHUNK && chunkIdx > 0) mimiState = initStateFromManifest(bundleMeta.mimi_state_manifest);
-
-      const chunkText = chunks[chunkIdx];
-      const tokenIds = tokenizer!.encodeIds(chunkText);
-      const textInput = tensor('int64', BigInt64Array.from(tokenIds.map((t) => BigInt(t))), [1, tokenIds.length]);
-
-      let textEmb = (await textConditionerSession.run({ token_ids: textInput }))[textConditionerSession.outputNames[0]] as ort.Tensor;
-      if (textEmb.dims.length === 2) textEmb = tensor('float32', new Float32Array(textEmb.data as Float32Array), [1, textEmb.dims[0], textEmb.dims[1]]);
-
-      const condResult = await flowLmMainSession.run({ sequence: emptySeq, text_embeddings: textEmb, ...flowLmState });
-      updateStateFromOutputs(flowLmState, condResult, bundleMeta.flow_lm_state_manifest);
-
-      const chunkLatents: Float32Array[] = [];
-      let chunkDecodedFrames = 0;
-      let currentLatent = tensor('float32', new Float32Array(latentDim).fill(NaN), [1, 1, latentDim]);
-      let eosStep: number | null = null;
-      let chunkEnded = false;
-
-      for (let step = 0; step < MAX_FRAMES; step++) {
-        if (!isGenerating) break;
-        // Yield periodically so 'ttsStop' messages are processed mid-generation.
-        if (step > 0 && step % 4 === 0) await new Promise((r) => setTimeout(r, 0));
-
-        const arResult = await flowLmMainSession.run({ sequence: currentLatent, text_embeddings: emptyTextEmb, ...flowLmState });
-        const conditioning = arResult.conditioning as ort.Tensor;
-        const eosLogit = (arResult.eos_logit as ort.Tensor).data as Float32Array;
-        const isEos = eosLogit[0] > -4.0;
-        if (isEos && eosStep == null) eosStep = step;
-        const shouldStop = eosStep != null && step >= eosStep + framesAfterEos;
-
-        const temperature = 0.7;
-        const std = Math.sqrt(temperature);
-        const latentData = new Float32Array(latentDim);
-        for (let i = 0; i < latentDim; i++) {
-          let u = 0, v = 0;
-          while (u === 0) u = Math.random();
-          while (v === 0) v = Math.random();
-          latentData[i] = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v) * std;
-        }
-        const dt = 1.0 / LSD_STEPS;
-        for (let lsdIndex = 0; lsdIndex < LSD_STEPS; lsdIndex++) {
-          const flowResult = await flowLmFlowSession.run({
-            c: conditioning,
-            s: stTensors[lsdIndex].s,
-            t: stTensors[lsdIndex].t,
-            x: tensor('float32', latentData, [1, latentDim]),
-          });
-          const flowDir = (flowResult.flow_dir as ort.Tensor).data as Float32Array;
-          for (let i = 0; i < latentDim; i++) latentData[i] += flowDir[i] * dt;
-        }
-
-        chunkLatents.push(new Float32Array(latentData));
-        currentLatent = tensor('float32', latentData, [1, 1, latentDim]);
-        updateStateFromOutputs(flowLmState, arResult, bundleMeta.flow_lm_state_manifest);
-
-        const pending = chunkLatents.length - chunkDecodedFrames;
-        let decodeSize = 0;
-        if (shouldStop) decodeSize = pending;
-        else if (isFirstAudioChunk && pending >= firstChunkFrames) decodeSize = firstChunkFrames;
-        else if (pending >= normalChunkFrames) decodeSize = normalChunkFrames;
-
-        if (decodeSize > 0) {
-          const decodeLatents = new Float32Array(decodeSize * latentDim);
-          for (let f = 0; f < decodeSize; f++) decodeLatents.set(chunkLatents[chunkDecodedFrames + f], f * latentDim);
-          const decodeResult = await mimiDecoderSession.run({ latent: tensor('float32', decodeLatents, [1, decodeSize, latentDim]), ...mimiState });
-          for (const e of bundleMeta.mimi_state_manifest) mimiState[e.input_name] = decodeResult[e.output_name] as ort.Tensor;
-          chunkDecodedFrames += decodeSize;
-          const audio = new Float32Array((decodeResult[mimiDecoderSession.outputNames[0]] as ort.Tensor).data as Float32Array);
-          const isLast = shouldStop && chunkIdx === chunks.length - 1;
-          post({ type: 'audioChunk', data: audio, sampleRate, isFirst: isFirstAudioChunk, isLast }, [audio.buffer]);
-          isFirstAudioChunk = false;
-        }
-        if (shouldStop) { chunkEnded = true; break; }
+    while (sessionId === id) {
+      if (!queue.length) {
+        if (finished) break;
+        await new Promise<void>((r) => { waiter = r; });
+        continue;
       }
-
-      // Brief silence between sentence chunks.
-      if (chunkEnded && isGenerating && chunkIdx < chunks.length - 1) {
-        const gap = new Float32Array(Math.max(1, Math.floor(CHUNK_GAP_SEC * sampleRate)));
-        post({ type: 'audioChunk', data: gap, sampleRate, isFirst: false, isLast: false }, [gap.buffer]);
-      }
+      const item = queue.shift()!;
+      if (sessionId !== id) break;
+      firstAudio = await generateItem(id, item.seq, item.text, firstAudio);
     }
-
-    void samplesPerFrame; // (kept from bundle for parity; not needed for playback)
-    post({ type: 'ttsSpeakDone', id });
+    if (sessionId === id) post({ type: 'ttsSpeakDone', id });
   } catch (err) {
     post({ type: 'ttsError', id, message: err instanceof Error ? err.message : String(err) });
   } finally {
-    isGenerating = false;
+    if (sessionId === id) sessionId = null;
   }
+}
+
+// ---- Generation loop for one sentence (ported faithfully; tags audio with the append `seq`
+//      so the panel can reveal the shown text in step with the spoken audio). Returns the
+//      updated firstAudio flag so the very first audio of the whole session uses the small
+//      first-chunk framing for a fast start. ----
+async function generateItem(id: number, seq: number, text: string, firstAudio: boolean): Promise<boolean> {
+  const { chunks, framesAfterEos } = splitIntoBestSentences(text);
+  if (!chunks.length) return firstAudio;
+
+  let mimiState = initStateFromManifest(bundleMeta!.mimi_state_manifest);
+  const emptySeq = tensor('float32', new Float32Array(0), [1, 0, latentDim]);
+  const emptyTextEmb = tensor('float32', new Float32Array(0), [1, 0, conditioningDim]);
+  const baseFlowState = voiceState!;
+  let flowLmState = cloneState(baseFlowState);
+
+  const firstChunkFrames = 3;
+  const normalChunkFrames = 12;
+  let isFirstAudioChunk = firstAudio;
+
+  for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx++) {
+    if (sessionId !== id) break;
+    if (RESET_FLOW_STATE_EACH_CHUNK && chunkIdx > 0) flowLmState = cloneState(baseFlowState);
+    if (RESET_MIMI_STATE_EACH_CHUNK && chunkIdx > 0) mimiState = initStateFromManifest(bundleMeta!.mimi_state_manifest);
+
+    const chunkText = chunks[chunkIdx];
+    const tokenIds = tokenizer!.encodeIds(chunkText);
+    const textInput = tensor('int64', BigInt64Array.from(tokenIds.map((t) => BigInt(t))), [1, tokenIds.length]);
+
+    let textEmb = (await textConditionerSession!.run({ token_ids: textInput }))[textConditionerSession!.outputNames[0]] as ort.Tensor;
+    if (textEmb.dims.length === 2) textEmb = tensor('float32', new Float32Array(textEmb.data as Float32Array), [1, textEmb.dims[0], textEmb.dims[1]]);
+
+    const condResult = await flowLmMainSession!.run({ sequence: emptySeq, text_embeddings: textEmb, ...flowLmState });
+    updateStateFromOutputs(flowLmState, condResult, bundleMeta!.flow_lm_state_manifest);
+
+    const chunkLatents: Float32Array[] = [];
+    let chunkDecodedFrames = 0;
+    let currentLatent = tensor('float32', new Float32Array(latentDim).fill(NaN), [1, 1, latentDim]);
+    let eosStep: number | null = null;
+    let chunkEnded = false;
+
+    for (let step = 0; step < MAX_FRAMES; step++) {
+      if (sessionId !== id) break;
+      // Yield periodically so ttsStop / ttsAppend / ttsFinish messages are processed mid-generation.
+      if (step > 0 && step % 4 === 0) await new Promise((r) => setTimeout(r, 0));
+
+      const arResult = await flowLmMainSession!.run({ sequence: currentLatent, text_embeddings: emptyTextEmb, ...flowLmState });
+      const conditioning = arResult.conditioning as ort.Tensor;
+      const eosLogit = (arResult.eos_logit as ort.Tensor).data as Float32Array;
+      const isEos = eosLogit[0] > -4.0;
+      if (isEos && eosStep == null) eosStep = step;
+      const shouldStop = eosStep != null && step >= eosStep + framesAfterEos;
+
+      const temperature = 0.7;
+      const std = Math.sqrt(temperature);
+      const latentData = new Float32Array(latentDim);
+      for (let i = 0; i < latentDim; i++) {
+        let u = 0, v = 0;
+        while (u === 0) u = Math.random();
+        while (v === 0) v = Math.random();
+        latentData[i] = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v) * std;
+      }
+      const dt = 1.0 / LSD_STEPS;
+      for (let lsdIndex = 0; lsdIndex < LSD_STEPS; lsdIndex++) {
+        const flowResult = await flowLmFlowSession!.run({
+          c: conditioning,
+          s: stTensors[lsdIndex].s,
+          t: stTensors[lsdIndex].t,
+          x: tensor('float32', latentData, [1, latentDim]),
+        });
+        const flowDir = (flowResult.flow_dir as ort.Tensor).data as Float32Array;
+        for (let i = 0; i < latentDim; i++) latentData[i] += flowDir[i] * dt;
+      }
+
+      chunkLatents.push(new Float32Array(latentData));
+      currentLatent = tensor('float32', latentData, [1, 1, latentDim]);
+      updateStateFromOutputs(flowLmState, arResult, bundleMeta!.flow_lm_state_manifest);
+
+      const pending = chunkLatents.length - chunkDecodedFrames;
+      let decodeSize = 0;
+      if (shouldStop) decodeSize = pending;
+      else if (isFirstAudioChunk && pending >= firstChunkFrames) decodeSize = firstChunkFrames;
+      else if (pending >= normalChunkFrames) decodeSize = normalChunkFrames;
+
+      if (decodeSize > 0) {
+        const decodeLatents = new Float32Array(decodeSize * latentDim);
+        for (let f = 0; f < decodeSize; f++) decodeLatents.set(chunkLatents[chunkDecodedFrames + f], f * latentDim);
+        const decodeResult = await mimiDecoderSession!.run({ latent: tensor('float32', decodeLatents, [1, decodeSize, latentDim]), ...mimiState });
+        for (const e of bundleMeta!.mimi_state_manifest) mimiState[e.input_name] = decodeResult[e.output_name] as ort.Tensor;
+        chunkDecodedFrames += decodeSize;
+        const audio = new Float32Array((decodeResult[mimiDecoderSession!.outputNames[0]] as ort.Tensor).data as Float32Array);
+        post({ type: 'audioChunk', data: audio, sampleRate, seq, isFirst: isFirstAudioChunk, isLast: false }, [audio.buffer]);
+        isFirstAudioChunk = false;
+      }
+      if (shouldStop) { chunkEnded = true; break; }
+    }
+
+    // Brief silence between sentence chunks.
+    if (chunkEnded && sessionId === id && chunkIdx < chunks.length - 1) {
+      const gap = new Float32Array(Math.max(1, Math.floor(CHUNK_GAP_SEC * sampleRate)));
+      post({ type: 'audioChunk', data: gap, sampleRate, seq, isFirst: false, isLast: false }, [gap.buffer]);
+    }
+  }
+
+  void samplesPerFrame; // (kept from bundle for parity; not needed for playback)
+  return isFirstAudioChunk;
 }
 
 function post(msg: Record<string, unknown>, transfer?: Transferable[]) {
@@ -524,14 +592,20 @@ function post(msg: Record<string, unknown>, transfer?: Transferable[]) {
 self.onmessage = async (e: MessageEvent<TtsWorkerRequest>) => {
   const msg = e.data;
   try {
-    if (msg.type === 'ttsStop') { isGenerating = false; return; }
+    if (msg.type === 'ttsStop') { stopSession(); return; }
     if (msg.type === 'ttsLoad') {
       if (isReady) { post({ type: 'ttsReady', id: msg.id }); return; }
       await load(msg.id);
       return;
     }
+    if (msg.type === 'ttsSpeakStream') { startSession(msg.id); return; }
+    if (msg.type === 'ttsAppend') { appendToSession(msg.id, msg.seq, msg.text); return; }
+    if (msg.type === 'ttsFinish') { finishSession(msg.id); return; }
     if (msg.type === 'ttsSpeak') {
-      await speak(msg.id, msg.text);
+      // One-shot speak is a stream of exactly one sentence-blob: open, append, finish.
+      startSession(msg.id);
+      appendToSession(msg.id, 0, msg.text);
+      finishSession(msg.id);
       return;
     }
   } catch (err) {

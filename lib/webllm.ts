@@ -18,6 +18,7 @@ function genFields(options: GenerateOptions) {
     ...(options.maxTokens != null ? { max_tokens: options.maxTokens } : {}),
     ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
     ...(options.enableThinking === false ? { extra_body: { enable_thinking: false } } : {}),
+    ...(options.frequencyPenalty ? { frequency_penalty: options.frequencyPenalty } : {}),
   };
 }
 

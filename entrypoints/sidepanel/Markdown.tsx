@@ -1,8 +1,12 @@
 import { memo, useState, type ReactNode } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
+import rehypeKatex from 'rehype-katex';
 import hljs from 'highlight.js/lib/common';
 import 'highlight.js/styles/atom-one-dark.css';
+import 'katex/dist/katex.min.css';
+import { normalizeMathDelimiters } from '@/lib/mathText';
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -133,8 +137,14 @@ const components: Components = {
 function MarkdownImpl({ content }: { content: string }) {
   return (
     <div className="markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
-        {content}
+      <ReactMarkdown
+        // singleDollarTextMath:false keeps prose like "$5 and $10" from parsing as math; the
+        // normalizer converts any real \(...\)/\[...\] to $$...$$ so nothing is lost.
+        remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }]]}
+        rehypePlugins={[rehypeKatex]}
+        components={components}
+      >
+        {normalizeMathDelimiters(content)}
       </ReactMarkdown>
     </div>
   );

@@ -19,7 +19,9 @@ export type VoiceAction =
   /** The reply is ready and about to be spoken. */
   | { type: 'speak' }
   /** Speech finished, or generation produced nothing / errored → resume listening. */
-  | { type: 'resume' };
+  | { type: 'resume' }
+  /** The user started talking while the assistant was thinking or speaking (barge-in). */
+  | { type: 'bargeIn' };
 
 /** Phases the panel drives directly; STT worker status is ignored while in them. */
 function isPanelOwned(state: VoiceState): boolean {
@@ -46,6 +48,11 @@ export function voiceReducer(state: VoiceState, action: VoiceAction): VoiceState
       return state === 'off' ? 'off' : 'speaking';
     case 'resume':
       return state === 'off' ? 'off' : 'listening';
+    case 'bargeIn':
+      // The user interrupted while the panel owned the phase (thinking/speaking): begin a new
+      // utterance. The panel then stops playback + aborts generation and the normal transcript
+      // flow carries on from 'speech'. Ignored from any other state.
+      return state === 'thinking' || state === 'speaking' ? 'speech' : state;
     default:
       return state;
   }

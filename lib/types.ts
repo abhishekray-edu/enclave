@@ -49,6 +49,9 @@ export interface ChatMessage {
   content: string;
   /** Structured (JSON) output for extraction tasks; content holds the raw JSON string. */
   structured?: { schemaId: string; data: unknown };
+  /** This assistant message is an error notice (content is the message) — rendered with a
+   *  warning icon instead of as markdown. */
+  error?: boolean;
 }
 
 export type Theme = 'system' | 'light' | 'dark';
@@ -61,6 +64,12 @@ export const MAX_CONTEXT_TOKENS = 16384;
 /** Default context window. Kept conservative (memory) and decoupled from the ceiling, so
  *  raising context to read bigger pages is an explicit, opt-in choice in Settings. */
 export const DEFAULT_CONTEXT_TOKENS = 8192;
+
+/** Hands-free "pause before responding": how long the mic must stay quiet before the utterance
+ *  is sent to the model. Plumbed to the VAD's redemption window (lib/vadFrameProcessor.ts). */
+export const MIN_VOICE_PAUSE_MS = 500;
+export const MAX_VOICE_PAUSE_MS = 2500;
+export const DEFAULT_VOICE_PAUSE_MS = 1200;
 
 export interface Settings {
   /** UI theme. 'system' follows the OS/browser preference. */
@@ -85,10 +94,14 @@ export interface Settings {
   /** Push-to-talk transcripts are auto-submitted (true) vs dropped into the composer to edit
    *  (false, default). Hands-free voice mode always auto-submits regardless of this. */
   voiceAutoSend: boolean;
+  /** Hands-free silence (ms) before an utterance is sent to the model (VAD redemption window). */
+  voicePauseMs: number;
+  /** Frequency penalty (0..1) passed to the model to curb repeated text (0 = off/default). */
+  repetitionPenalty: number;
 }
 
 export const SYSTEM_PROMPT =
-  'You are a helpful assistant embedded in a web browser. Answer the user based on the content of the web page provided in the context. Be concise and accurate.';
+  'You are a helpful assistant embedded in a web browser. Answer the user based on the content of the web page provided in the context. Be concise and accurate. Format answers in GitHub-flavored Markdown. For mathematics, use LaTeX inside dollar-sign delimiters — $$...$$ for both inline and display math; never use \\[...\\] or \\(...\\) delimiters, and do not wrap answers in \\boxed{}.';
 
 export const DEFAULT_SETTINGS: Settings = {
   theme: 'system',
@@ -101,6 +114,8 @@ export const DEFAULT_SETTINGS: Settings = {
   viewportBoost: false,
   ttsAutoRead: false,
   voiceAutoSend: false,
+  voicePauseMs: DEFAULT_VOICE_PAUSE_MS,
+  repetitionPenalty: 0,
 };
 
 // ---- Messaging protocol (runtime.sendMessage) ----

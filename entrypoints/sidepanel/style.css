@@ -216,6 +216,16 @@ body {
   line-height: 1.55;
   word-break: break-word;
 }
+/* Display math can be wider than the narrow side panel — let it scroll on its own instead of
+   forcing the page body to scroll horizontally. */
+.markdown .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.15rem 0;
+}
+.markdown .katex {
+  font-size: 1.02em;
+}
 .markdown > :first-child {
   margin-top: 0;
 }

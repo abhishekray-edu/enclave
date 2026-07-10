@@ -89,6 +89,8 @@ function finishSpeak() {
     ttsMuted = false;
     applyMicMute();
   }
+  // Barge-in mode: drop the VAD ducking profile now that playback is over.
+  setDucking(false);
 }
 
 function ensureTtsWorker(): Worker {
@@ -96,15 +98,19 @@ function ensureTtsWorker(): Worker {
     ttsWorker = new Worker(new URL('./tts.worker.ts', import.meta.url), { type: 'module' });
     ttsPlayer = new TtsPlayer();
     ttsPlayer.onEnded(finishSpeak);
+    // A streamed sentence's audio started — tell the panel so it can reveal the shown text in step.
+    ttsPlayer.onChunkStarted((seq) => {
+      if (ttsPort && ttsSpeakId != null) send(ttsPort, { type: 'ttsChunkStarted', id: ttsSpeakId, seq });
+    });
     ttsWorker.onmessage = (e: MessageEvent) => {
       const msg = e.data as
-        | { type: 'audioChunk'; data: Float32Array; sampleRate: number }
+        | { type: 'audioChunk'; data: Float32Array; sampleRate: number; seq?: number }
         | { type: 'ttsSpeakDone'; id: number }
         | { type: 'ttsProgress'; id: number; progress: number }
         | { type: 'ttsReady'; id: number }
         | { type: 'ttsError'; id: number; message: string };
       if (msg.type === 'audioChunk') {
-        void ttsPlayer?.play(msg.data, msg.sampleRate);
+        void ttsPlayer?.play(msg.data, msg.sampleRate, msg.seq);
       } else if (msg.type === 'ttsSpeakDone') {
         // Generation finished; signal end-of-stream so the player fires onEnded once drained.
         ttsPlayer?.end();
@@ -112,6 +118,7 @@ function ensureTtsWorker(): Worker {
         ttsPlayer?.stop();
         ttsSpeakId = null;
         if (ttsMuted) { ttsMuted = false; applyMicMute(); }
+        setDucking(false);
         if (ttsPort) send(ttsPort, msg);
       } else {
         if (ttsPort) send(ttsPort, msg); // ttsProgress / ttsReady
@@ -138,6 +145,7 @@ let sttSessionId: number | null = null; // id of the active sttStart (for surfac
 let mic: MicCapture | null = null;
 let panelMuted = false; // panel-requested mute (e.g. while it drives TTS)
 let ttsMuted = false; // safety mute while TTS is playing (echo guard, belt-and-braces with panel)
+let sttBargeIn = false; // hands-free barge-in: keep the mic live during TTS (duck the VAD instead)
 
 /** Mic is silenced whenever the panel asks OR while speech is playing. Gate the worklet frames
  *  (track stays live, so no Chrome mic churn) and tell the worker to drop its VAD context. */
@@ -145,6 +153,23 @@ function applyMicMute() {
   const shouldMute = panelMuted || ttsMuted;
   mic?.setMuted(shouldMute);
   sttWorker?.postMessage({ type: 'sttMute', muted: shouldMute });
+}
+
+/** Barge-in echo guard: instead of muting the mic during playback, raise the VAD thresholds so
+ *  the assistant's own voice (or a transient) can't trigger a false interruption. */
+function setDucking(active: boolean) {
+  sttWorker?.postMessage({ type: 'sttDucking', active });
+}
+
+/** Apply the right echo guard when speech starts: in barge-in mode duck the VAD (mic stays live
+ *  so the user can interrupt); otherwise hard-mute the mic for the duration of playback. */
+function applyTtsEchoGuard() {
+  if (sttBargeIn) {
+    setDucking(true);
+  } else {
+    ttsMuted = true;
+    applyMicMute();
+  }
 }
 
 function ensureSttWorker(): Worker {
@@ -186,6 +211,7 @@ function releaseStt() {
   sttSessionId = null;
   panelMuted = false;
   ttsMuted = false;
+  sttBargeIn = false;
 }
 
 /** Ensure the requested model + context is loaded, reusing it if already resident. */
@@ -220,6 +246,7 @@ browser.runtime.onConnect.addListener((port) => {
       sttSessionId = null;
       panelMuted = false;
       ttsMuted = false;
+      sttBargeIn = false;
     }
   });
 
@@ -235,11 +262,28 @@ browser.runtime.onConnect.addListener((port) => {
     if (msg.type === 'ttsSpeak') {
       ttsPort = port;
       ttsSpeakId = msg.id;
-      // Echo guard: mute the mic for the whole time speech plays (cleared in finishSpeak).
-      ttsMuted = true;
-      applyMicMute();
+      applyTtsEchoGuard();
       ttsPlayer?.stop(); // clear any previous utterance before the new one
       ensureTtsWorker().postMessage({ type: 'ttsSpeak', id: msg.id, text: msg.text });
+      return;
+    }
+
+    if (msg.type === 'ttsSpeakStream') {
+      ttsPort = port;
+      ttsSpeakId = msg.id;
+      applyTtsEchoGuard();
+      ttsPlayer?.stop();
+      ensureTtsWorker().postMessage({ type: 'ttsSpeakStream', id: msg.id });
+      return;
+    }
+
+    if (msg.type === 'ttsAppend') {
+      ttsWorker?.postMessage({ type: 'ttsAppend', id: msg.id, seq: msg.seq, text: msg.text });
+      return;
+    }
+
+    if (msg.type === 'ttsFinish') {
+      ttsWorker?.postMessage({ type: 'ttsFinish', id: msg.id });
       return;
     }
 
@@ -265,11 +309,15 @@ browser.runtime.onConnect.addListener((port) => {
       sttPort = port;
       sttSessionId = msg.id;
       panelMuted = false;
+      sttBargeIn = msg.bargeIn === true;
       // Speech may already be playing (e.g. voice mode toggled on while a reply is being read
-      // aloud) — keep the echo guard up until finishSpeak clears it.
-      ttsMuted = ttsSpeakId != null;
-      ensureSttWorker().postMessage({ type: 'sttStart', id: msg.id, mode: msg.mode });
+      // aloud). In barge-in mode keep the mic live but duck the VAD; otherwise keep the hard
+      // echo-guard mute up until finishSpeak clears it.
+      const speaking = ttsSpeakId != null;
+      ttsMuted = speaking && !sttBargeIn;
+      ensureSttWorker().postMessage({ type: 'sttStart', id: msg.id, mode: msg.mode, pauseMs: msg.pauseMs });
       await startMic();
+      if (speaking && sttBargeIn) setDucking(true);
       return;
     }
 

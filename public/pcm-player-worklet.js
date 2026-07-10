@@ -18,6 +18,9 @@ class PCMProcessor extends AudioWorkletProcessor {
     this.readPos = 0;
     this.writePos = 0;
     this.isPlaying = false;
+    // Monotonic count of samples actually played (read out of the ring). The main thread maps it
+    // to per-sentence write watermarks to reveal displayed text in step with the audio.
+    this.totalReadSamples = 0;
 
     // Start playback only once ~300ms is buffered; aim to keep ~2x that queued.
     this.minBufferSamples = Math.floor((300 * sampleRate) / 1000);
@@ -27,7 +30,9 @@ class PCMProcessor extends AudioWorkletProcessor {
     this.playbackCompleteReported = false;
 
     this.frameCount = 0;
-    this.reportInterval = 256;
+    // ~32 quanta ≈ 170 ms between capacity reports — frequent enough for approximate text/audio
+    // sync without flooding the main thread.
+    this.reportInterval = 32;
 
     this.port.onmessage = (e) => {
       switch (e.data.type) {
@@ -103,7 +108,14 @@ class PCMProcessor extends AudioWorkletProcessor {
     if (buffered < this.targetBufferSamples) {
       requestSamples = Math.min(capacity, this.targetBufferSamples - buffered);
     }
-    this.port.postMessage({ type: 'capacity', buffered, capacity, requestSamples, isPlaying: this.isPlaying });
+    this.port.postMessage({
+      type: 'capacity',
+      buffered,
+      capacity,
+      requestSamples,
+      isPlaying: this.isPlaying,
+      totalReadSamples: this.totalReadSamples,
+    });
   }
 
   readInto(outputChannel, count) {
@@ -117,6 +129,7 @@ class PCMProcessor extends AudioWorkletProcessor {
       outputChannel.set(this.ringBuffer.subarray(0, count - firstPart), firstPart);
       this.readPos = count - firstPart;
     }
+    this.totalReadSamples += count;
   }
 
   process(_inputs, outputs) {
@@ -164,6 +177,7 @@ class PCMProcessor extends AudioWorkletProcessor {
     this.isPlaying = false;
     this.streamEnded = false;
     this.playbackCompleteReported = false;
+    this.totalReadSamples = 0;
     this.sendCapacityUpdate();
   }
 }

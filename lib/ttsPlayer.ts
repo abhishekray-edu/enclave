@@ -18,15 +18,26 @@ export class TtsPlayer {
   private ctx: AudioContext | null = null;
   private node: AudioWorkletNode | null = null;
   private initPromise: Promise<void> | null = null;
-  private pending: Float32Array[] = [];
+  private pending: { data: Float32Array; seq?: number }[] = [];
   private availableCapacity = 0;
   private gotInitialCapacity = false;
   private streamEndPending = false;
   private endedCb: (() => void) | null = null;
+  private chunkStartedCb: ((seq: number) => void) | null = null;
   private sampleRate = 24000;
+  // Per-sentence sync: as samples are written to the worklet we record the sample index at which
+  // each `seq` first appears; when the worklet reports the playhead crossing that index, the
+  // sentence's audio has started and we fire onChunkStarted(seq).
+  private totalWrittenSamples = 0;
+  private lastWrittenSeq: number | undefined = undefined;
+  private watermarks: { seq: number; startSample: number }[] = [];
 
   onEnded(cb: () => void) {
     this.endedCb = cb;
+  }
+
+  onChunkStarted(cb: (seq: number) => void) {
+    this.chunkStartedCb = cb;
   }
 
   private async ensure(sampleRate: number): Promise<void> {
@@ -56,9 +67,16 @@ export class TtsPlayer {
     }
   }
 
-  private onWorkletMessage(data: { type: string; capacity?: number; buffered?: number; requestSamples?: number }) {
+  private onWorkletMessage(data: {
+    type: string;
+    capacity?: number;
+    buffered?: number;
+    requestSamples?: number;
+    totalReadSamples?: number;
+  }) {
     if (data.type === 'capacity') {
       this.availableCapacity = data.capacity ?? 0;
+      this.fireWatermarks(data.totalReadSamples ?? 0);
       if (!this.gotInitialCapacity) {
         this.gotInitialCapacity = true;
         this.flush();
@@ -72,18 +90,36 @@ export class TtsPlayer {
     }
   }
 
+  /** Fire onChunkStarted for every sentence whose first sample the playhead has now reached. */
+  private fireWatermarks(totalReadSamples: number) {
+    while (this.watermarks.length && totalReadSamples >= Math.max(1, this.watermarks[0].startSample)) {
+      const wm = this.watermarks.shift()!;
+      this.chunkStartedCb?.(wm.seq);
+    }
+  }
+
+  /** Send one buffer to the worklet, recording a watermark when its `seq` first appears. */
+  private writeToNode(data: Float32Array, seq: number | undefined) {
+    if (seq !== undefined && seq !== this.lastWrittenSeq) {
+      this.watermarks.push({ seq, startSample: this.totalWrittenSamples });
+      this.lastWrittenSeq = seq;
+    }
+    this.totalWrittenSamples += data.length;
+    this.node!.port.postMessage({ type: 'audio', data }, [data.buffer]);
+  }
+
   /** Send one queued chunk if it fits; capacity zeroes until the next worklet update. */
   private flush() {
     if (!this.node || !this.pending.length || this.availableCapacity <= 0) return;
     const chunk = this.pending[0];
-    if (chunk.length <= this.availableCapacity) {
+    if (chunk.data.length <= this.availableCapacity) {
       this.pending.shift();
-      this.node.port.postMessage({ type: 'audio', data: chunk }, [chunk.buffer]);
+      this.writeToNode(chunk.data, chunk.seq);
       this.availableCapacity = 0;
     } else if (this.availableCapacity > 4096) {
-      const partial = chunk.slice(0, this.availableCapacity);
-      this.pending[0] = chunk.slice(this.availableCapacity);
-      this.node.port.postMessage({ type: 'audio', data: partial }, [partial.buffer]);
+      const partial = chunk.data.slice(0, this.availableCapacity);
+      this.pending[0] = { data: chunk.data.slice(this.availableCapacity), seq: chunk.seq };
+      this.writeToNode(partial, chunk.seq);
       this.availableCapacity = 0;
     }
     if (!this.pending.length && this.streamEndPending) {
@@ -92,10 +128,11 @@ export class TtsPlayer {
     }
   }
 
-  /** Queue a chunk for playback (creating the context on first use). */
-  async play(chunk: Float32Array, sampleRate: number): Promise<void> {
+  /** Queue a chunk for playback (creating the context on first use). `seq` (when given) ties the
+   *  chunk to a streamed sentence for text/audio sync. */
+  async play(chunk: Float32Array, sampleRate: number, seq?: number): Promise<void> {
     await this.ensure(sampleRate);
-    this.pending.push(chunk);
+    this.pending.push({ data: chunk, seq });
     if (this.gotInitialCapacity && this.availableCapacity > 0) this.flush();
   }
 
@@ -111,6 +148,9 @@ export class TtsPlayer {
     this.pending = [];
     this.streamEndPending = false;
     this.availableCapacity = 0;
+    this.totalWrittenSamples = 0;
+    this.lastWrittenSeq = undefined;
+    this.watermarks = [];
     this.node?.port.postMessage({ type: 'reset' });
   }
 
