@@ -30,12 +30,24 @@ first time you use a feature that needs them, from public model hosts:
 - the **language model** weights (WebLLM's public CDN) the first time you select a model;
 - the **embedding model** used for reading long pages (Hugging Face), on first use;
 - the **text-to-speech voice** (pocket-tts, ~132 MB) from a public Hugging Face repository,
-  the first time you press "Speak" or enable "Read replies aloud automatically".
+  the first time you press "Speak" or enable "Read replies aloud automatically";
+- the **speech-recognition model** (Moonshine, ~93 MB, Hugging Face) the first time you use the
+  microphone or hands-free voice mode. (The voice-activity detector ships inside the extension,
+  so it needs no download.)
 
 Each downloads model files to your machine, where the browser caches them for reuse. No page
 content, questions, answers, or personal information is included in these requests. The
-text-to-speech synthesis itself then runs entirely on-device — the text being spoken is never
-transmitted.
+text-to-speech synthesis and speech recognition themselves then run entirely on-device — the
+text being spoken and the audio from your microphone are never transmitted.
+
+## Microphone
+
+Voice input is off by default. When you press the microphone button or enable hands-free voice
+mode, Enclave asks for microphone permission (once) and then captures audio only while you are
+actively using voice input. The audio is processed entirely on your device by the local
+speech-recognition model to produce text; it is never recorded to disk, uploaded, or sent
+anywhere. Turning voice mode off, or closing the side panel, stops the capture and releases the
+microphone.
 
 ## No telemetry, analytics, or accounts
 
@@ -56,7 +68,8 @@ right-click menu, or pressing the keyboard shortcut):
 - **contextMenus** — to add the right-click "Ask Enclave" / "Explain selection" actions.
 - **storage** — to save your settings and cache processed page text locally.
 - **offscreen** — to run the local model (WebGPU/WASM inference) outside the panel's
-  lifecycle, and to play synthesized speech for the "Speak" feature.
+  lifecycle, to play synthesized speech for the "Speak" feature, and to transcribe microphone
+  audio on-device for voice mode.
 
 None of these permissions are used to monitor browsing activity in the background or on
 tabs other than the one you're actively working with.

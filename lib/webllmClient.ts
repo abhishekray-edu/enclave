@@ -98,7 +98,14 @@ export type PanelToOffscreen =
   | { type: 'ttsLoad'; id: number }
   | { type: 'ttsSpeak'; id: number; text: string }
   | { type: 'ttsStop' }
-  | { type: 'ttsRelease' };
+  | { type: 'ttsRelease' }
+  // Speech-to-text (Moonshine + Silero VAD). Mic PCM never crosses this Port either — it is
+  // captured and transcribed in the offscreen doc; only these control/status messages travel.
+  | { type: 'sttLoad'; id: number }
+  | { type: 'sttStart'; id: number; mode: 'ptt' | 'auto' }
+  | { type: 'sttMute'; muted: boolean }
+  | { type: 'sttStop'; flush?: boolean }
+  | { type: 'sttRelease' };
 
 export type OffscreenToPanel =
   | { type: 'progress'; id: number; report: LoadProgress }
@@ -119,7 +126,14 @@ export type OffscreenToPanel =
   | { type: 'ttsProgress'; id: number; progress: number }
   | { type: 'ttsReady'; id: number }
   | { type: 'ttsEnded'; id: number }
-  | { type: 'ttsError'; id: number; message: string };
+  | { type: 'ttsError'; id: number; message: string }
+  // Speech-to-text status. `id` ties messages to the sttLoad/sttStart request that owns them.
+  | { type: 'sttProgress'; id: number; progress: number }
+  | { type: 'sttReady'; id: number }
+  | { type: 'sttState'; id: number; state: 'listening' | 'speech' | 'transcribing' | 'muted' }
+  | { type: 'sttTranscript'; id: number; text: string }
+  | { type: 'sttStopped'; id: number }
+  | { type: 'sttError'; id: number; message: string };
 
 export type WebllmPort = ReturnType<typeof browser.runtime.connect>;
 

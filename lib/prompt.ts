@@ -122,23 +122,39 @@ export interface BuiltPrompt {
   usedChunks?: RetrievedChunk[];
 }
 
+/** Appended to the system prompt when page context is toggled off, so the model doesn't
+ *  hallucinate a page it was never shown. */
+const NO_PAGE_NOTE =
+  'Page context is turned off: you cannot see the current web page. Answer from the conversation ' +
+  'and general knowledge only, and if asked about "this page", say that page context is disabled.';
+
 /**
  * Build the message array: a system message carrying the page context, followed by the
  * conversation. The body is assembled by the best available strategy — retrieved chunks
  * (RAG) if provided, else structure-aware section selection, else head truncation — all
  * bounded by the per-model context budget. Returns coverage info for the UI.
+ *
+ * `page: null` means page context is disabled — nothing from the tab (not even title or
+ * URL) enters the prompt.
  */
 export function buildMessages(
   settings: Settings,
-  page: PageContent,
+  page: PageContent | null,
   conversation: ChatMessage[],
   /** Context window in tokens to budget the page text against. */
   ctxTokens: number,
   opts?: BuildOptions,
 ): BuiltPrompt {
+  const systemPromptBase = opts?.systemPromptOverride ?? settings.systemPrompt;
+  if (!page) {
+    return {
+      messages: [{ role: 'system', content: `${systemPromptBase}\n\n${NO_PAGE_NOTE}` }, ...conversation],
+      truncated: false,
+      mode: 'full',
+    };
+  }
   const header = pageHeader(page);
-  const systemPrompt = opts?.systemPromptOverride ?? settings.systemPrompt;
-  let budget = pageBudgetTokens(settings, page, conversation, ctxTokens, systemPrompt);
+  let budget = pageBudgetTokens(settings, page, conversation, ctxTokens, systemPromptBase);
   if (opts?.maxBodyTokens != null) budget = Math.min(budget, opts.maxBodyTokens);
   const includeBody = opts?.includeBody ?? true;
 
@@ -164,7 +180,7 @@ export function buildMessages(
     truncated = estimateTokens(page.textContent) > budget;
   }
 
-  const systemBase = `${systemPrompt}\n\n--- PAGE CONTEXT ---\n${header}\n\n--- PAGE CONTENT ---\n`;
+  const systemBase = `${systemPromptBase}\n\n--- PAGE CONTEXT ---\n${header}\n\n--- PAGE CONTENT ---\n`;
   const system: ChatMessage = { role: 'system', content: systemBase + body };
   return {
     messages: [system, ...conversation],

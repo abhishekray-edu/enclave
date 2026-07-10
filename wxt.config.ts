@@ -7,10 +7,11 @@ import path from 'node:path';
 // dynamic-imports its wasm runtime from a CDN by default, which the extension CSP
 // (script-src 'self') blocks. Ship the runtime inside the extension instead; lib/ortEnv.ts
 // points the loader here at runtime.
-// Only Transformers.js (ml.worker.ts, RAG/compression) needs this manual copy: it dynamic-
-// imports its ORT loader at runtime, so Vite can't emit it and lib/ortEnv.ts points it here.
-// The pocket-tts TTS worker instead imports 'onnxruntime-web/wasm' (the bundle build), whose
-// .wasm Vite emits into assets/ and ORT self-locates — no manual copy needed there.
+// Only Transformers.js (ml.worker.ts for RAG/compression, and stt.worker.ts for the Moonshine
+// speech model) needs this manual copy: it dynamic-imports its ORT loader at runtime, so Vite
+// can't emit it and lib/ortEnv.ts points it here. The pocket-tts TTS worker and stt.worker.ts's
+// Silero VAD both instead import 'onnxruntime-web/wasm' (the bundle build), whose .wasm Vite
+// emits into assets/ and ORT self-locates — no manual copy needed there.
 const ORT_FILES = ['ort-wasm-simd-threaded.asyncify.mjs', 'ort-wasm-simd-threaded.asyncify.wasm'];
 
 // See https://wxt.dev/api/config.html

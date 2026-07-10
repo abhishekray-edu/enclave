@@ -45,11 +45,31 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SO
 
 ### onnxruntime-web
 - Source: https://github.com/microsoft/onnxruntime — **License: MIT** (© Microsoft). Runs the
-  TTS models on the CPU (WebAssembly).
+  TTS, STT, and VAD models on the CPU (WebAssembly).
+
+## Speech-to-text (the microphone / "voice mode" feature)
+
+### Moonshine — speech-recognition model
+- Source: https://huggingface.co/UsefulSensors/moonshine (Useful Sensors); ONNX build
+  `onnx-community/moonshine-base-ONNX`.
+- **License: MIT** — used to transcribe microphone audio on-device (English). Weights are
+  fetched once from the Hugging Face CDN at first use and cached in the browser; not
+  redistributed by this project.
+
+### Silero VAD — voice-activity detector
+- Source: https://github.com/snakers4/silero-vad (Silero Team); ONNX mirror
+  `onnx-community/silero-vad`.
+- **License: MIT.** The ~2.2 MB v5 ONNX model is vendored in `public/vad/` and redistributed
+  under the MIT license (refresh with `node scripts/prepare-vad-assets.mjs`).
+
+### @ricky0123/vad-web — VAD endpointing semantics
+- Source: https://github.com/ricky0123/vad — **License: MIT.** The frame-level endpointing
+  state machine in `lib/vadFrameProcessor.ts` is a port of this project's logic (thresholds,
+  redemption frames, pre-speech padding); no code is bundled.
 
 ## Also used elsewhere in Enclave
 - @mlc-ai/web-llm (Apache-2.0) — in-browser LLM engine.
-- @huggingface/transformers / Transformers.js (Apache-2.0) — RAG embeddings.
+- @huggingface/transformers / Transformers.js (Apache-2.0) — RAG embeddings and Moonshine STT.
 - @mozilla/readability (Apache-2.0), react (MIT), react-markdown (MIT), highlight.js (BSD-3),
   js-tiktoken (MIT), @atjsh/llmlingua-2 (MIT).
 

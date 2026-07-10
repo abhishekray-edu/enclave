@@ -24,10 +24,12 @@ async function ensureOffscreen() {
   if (await offscreen.hasDocument()) return;
   await offscreen.createDocument({
     url: OFFSCREEN_URL,
-    // WORKERS: hosts the WebLLM engine + ML/TTS workers. AUDIO_PLAYBACK: lets the document
-    // play synthesized speech (pocket-tts) without a foreground user gesture.
-    reasons: ['WORKERS', 'AUDIO_PLAYBACK'],
-    justification: 'Runs the local AI model so it stays loaded between uses, and plays synthesized speech.',
+    // WORKERS: hosts the WebLLM engine + ML/TTS/STT workers. AUDIO_PLAYBACK: plays synthesized
+    // speech (pocket-tts) without a foreground gesture. USER_MEDIA: captures the microphone for
+    // local speech-to-text (once the one-time mic-permission page has granted access).
+    reasons: ['WORKERS', 'AUDIO_PLAYBACK', 'USER_MEDIA'],
+    justification:
+      'Runs the local AI model so it stays loaded between uses, plays synthesized speech, and transcribes microphone input for voice mode — all on-device.',
   });
 }
 
