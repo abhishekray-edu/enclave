@@ -6,6 +6,7 @@ import { createWebllmEngine, chatStreamWebllm, chatCompleteWebllm, isModelCached
 import { createModelLoader } from '@/lib/modelLoader';
 import { PORT_NAME, type OffscreenToPanel, type PanelToOffscreen, type WebllmPort } from '@/lib/webllmClient';
 import { TtsPlayer } from '@/lib/ttsPlayer';
+import { MicCapture } from '@/lib/micCapture';
 // NOTE: lib/retrieval (Transformers.js + onnxruntime) and lib/compress (LLMLingua-2) run in
 // a dedicated worker (ml.worker.ts, created lazily) so a plain Q&A never loads that heavy
 // machinery AND embedding never blocks this document's main thread — the side panel usually
@@ -83,6 +84,11 @@ function finishSpeak() {
     send(ttsPort, { type: 'ttsEnded', id: ttsSpeakId });
     ttsSpeakId = null;
   }
+  // Speech finished: lift the echo-guard mute so the mic can hear the user again.
+  if (ttsMuted) {
+    ttsMuted = false;
+    applyMicMute();
+  }
 }
 
 function ensureTtsWorker(): Worker {
@@ -105,6 +111,7 @@ function ensureTtsWorker(): Worker {
       } else if (msg.type === 'ttsError') {
         ttsPlayer?.stop();
         ttsSpeakId = null;
+        if (ttsMuted) { ttsMuted = false; applyMicMute(); }
         if (ttsPort) send(ttsPort, msg);
       } else {
         if (ttsPort) send(ttsPort, msg); // ttsProgress / ttsReady
@@ -120,6 +127,65 @@ function releaseTts() {
   ttsPlayer = null;
   ttsWorker?.terminate();
   ttsWorker = null;
+}
+
+// ---- Speech-to-text (Moonshine + Silero VAD): CPU inference in a dedicated worker; mic capture
+//      here in the offscreen doc (created with the USER_MEDIA reason). PCM never crosses the
+//      Port — only small status/transcript messages do. ----
+let sttWorker: Worker | null = null;
+let sttPort: WebllmPort | null = null; // the panel port that owns the current listening session
+let sttSessionId: number | null = null; // id of the active sttStart (for surfacing mic errors)
+let mic: MicCapture | null = null;
+let panelMuted = false; // panel-requested mute (e.g. while it drives TTS)
+let ttsMuted = false; // safety mute while TTS is playing (echo guard, belt-and-braces with panel)
+
+/** Mic is silenced whenever the panel asks OR while speech is playing. Gate the worklet frames
+ *  (track stays live, so no Chrome mic churn) and tell the worker to drop its VAD context. */
+function applyMicMute() {
+  const shouldMute = panelMuted || ttsMuted;
+  mic?.setMuted(shouldMute);
+  sttWorker?.postMessage({ type: 'sttMute', muted: shouldMute });
+}
+
+function ensureSttWorker(): Worker {
+  if (!sttWorker) {
+    sttWorker = new Worker(new URL('./stt.worker.ts', import.meta.url), { type: 'module' });
+    // The worker speaks the panel's stt* message shapes; relay each to the panel port verbatim.
+    sttWorker.onmessage = (e: MessageEvent<OffscreenToPanel>) => {
+      if (sttPort) send(sttPort, e.data);
+    };
+  }
+  return sttWorker;
+}
+
+/** Begin mic capture, transferring each 512-sample frame to the STT worker. */
+async function startMic() {
+  if (!mic) mic = new MicCapture();
+  if (mic.isRunning) return;
+  try {
+    await mic.start((frame) => {
+      sttWorker?.postMessage({ type: 'frame', data: frame }, [frame.buffer]);
+    });
+    applyMicMute();
+  } catch (e) {
+    // No mic → the session can't do anything. Report the error, then end the worker session so
+    // the panel receives sttStopped and doesn't sit on a dead "Listening…" indicator.
+    if (sttPort) send(sttPort, { type: 'sttError', id: sttSessionId ?? -1, message: errStr(e) });
+    sttWorker?.postMessage({ type: 'sttStop' });
+  }
+}
+
+async function stopMic() {
+  await mic?.stop();
+}
+
+function releaseStt() {
+  void stopMic();
+  sttWorker?.terminate();
+  sttWorker = null;
+  sttSessionId = null;
+  panelMuted = false;
+  ttsMuted = false;
 }
 
 /** Ensure the requested model + context is loaded, reusing it if already resident. */
@@ -146,6 +212,15 @@ browser.runtime.onConnect.addListener((port) => {
       ttsPort = null;
       ttsSpeakId = null;
     }
+    // Panel closed: stop the mic so the Chrome mic indicator disappears, and end the session.
+    if (sttPort === port) {
+      sttWorker?.postMessage({ type: 'sttStop' });
+      void stopMic();
+      sttPort = null;
+      sttSessionId = null;
+      panelMuted = false;
+      ttsMuted = false;
+    }
   });
 
   port.onMessage.addListener(async (raw) => {
@@ -160,6 +235,9 @@ browser.runtime.onConnect.addListener((port) => {
     if (msg.type === 'ttsSpeak') {
       ttsPort = port;
       ttsSpeakId = msg.id;
+      // Echo guard: mute the mic for the whole time speech plays (cleared in finishSpeak).
+      ttsMuted = true;
+      applyMicMute();
       ttsPlayer?.stop(); // clear any previous utterance before the new one
       ensureTtsWorker().postMessage({ type: 'ttsSpeak', id: msg.id, text: msg.text });
       return;
@@ -174,6 +252,43 @@ browser.runtime.onConnect.addListener((port) => {
 
     if (msg.type === 'ttsRelease') {
       releaseTts();
+      return;
+    }
+
+    if (msg.type === 'sttLoad') {
+      sttPort = port;
+      ensureSttWorker().postMessage({ type: 'sttLoad', id: msg.id });
+      return;
+    }
+
+    if (msg.type === 'sttStart') {
+      sttPort = port;
+      sttSessionId = msg.id;
+      panelMuted = false;
+      // Speech may already be playing (e.g. voice mode toggled on while a reply is being read
+      // aloud) — keep the echo guard up until finishSpeak clears it.
+      ttsMuted = ttsSpeakId != null;
+      ensureSttWorker().postMessage({ type: 'sttStart', id: msg.id, mode: msg.mode });
+      await startMic();
+      return;
+    }
+
+    if (msg.type === 'sttMute') {
+      panelMuted = msg.muted;
+      applyMicMute();
+      return;
+    }
+
+    if (msg.type === 'sttStop') {
+      // Frames already posted arrive before this (ordered channel), so the worker can transcribe
+      // any buffered push-to-talk audio; then release the mic (kills the Chrome mic indicator).
+      sttWorker?.postMessage({ type: 'sttStop', flush: msg.flush });
+      await stopMic();
+      return;
+    }
+
+    if (msg.type === 'sttRelease') {
+      releaseStt();
       return;
     }
 

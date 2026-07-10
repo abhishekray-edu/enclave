@@ -23,6 +23,17 @@ import {
 } from '@/lib/webllmClient';
 import { isLoadInterruption } from '@/lib/modelLoader';
 import { ttsLoad, ttsSpeak, ttsStop, ttsRelease, TTS_DOWNLOAD_MB } from '@/lib/ttsClient';
+import {
+  sttLoad,
+  sttStartListening,
+  sttMute,
+  sttRelease,
+  micPermissionState,
+  openMicPermissionPage,
+  STT_DOWNLOAD_MB,
+  type SttSession,
+} from '@/lib/sttClient';
+import { voiceReducer, type VoiceState } from '@/lib/voiceReducer';
 import { buildMessages, pageBudgetTokens, estimateTokens, type BuiltPrompt } from '@/lib/prompt';
 import { chunkPage } from '@/lib/chunking';
 import { summarizeChunks } from '@/lib/summarize';
@@ -43,6 +54,15 @@ import {
 } from '@/lib/types';
 
 const PENDING_KEY = 'pendingAction';
+/** Human labels for the hands-free voice loop's states (see lib/voiceReducer.ts). */
+const VOICE_STATE_LABEL: Record<VoiceState, string> = {
+  off: '',
+  listening: 'Listening…',
+  speech: 'Heard you…',
+  transcribing: 'Transcribing…',
+  thinking: 'Thinking…',
+  speaking: 'Speaking…',
+};
 /** Persists which models have an interrupted (resumable) download, so the paused state
  *  survives the panel being recreated on close/reopen. */
 const PAUSED_MODELS_KEY = 'pausedDownloads';
@@ -52,9 +72,15 @@ const NEXT_TOKEN_TIMEOUT_MS = 45_000;
 const AUTO_SCROLL_BOTTOM_PX = 48;
 
 // chrome.scripting isn't in the polyfill types; access the global directly.
-const scripting = (globalThis as unknown as {
-  chrome: { scripting: { executeScript(opts: { target: { tabId: number }; files: string[] }): Promise<unknown> } };
-}).chrome.scripting;
+const scripting = (
+  globalThis as unknown as {
+    chrome: {
+      scripting: {
+        executeScript(opts: { target: { tabId: number }; files: string[] }): Promise<unknown>;
+      };
+    };
+  }
+).chrome.scripting;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string, onTimeout?: () => void): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -92,7 +118,10 @@ async function capturePage(wantViewport = false): Promise<PageContent> {
   } catch {
     // Content script not loaded in this tab — inject it, then retry once.
     try {
-      await scripting.executeScript({ target: { tabId }, files: ['content-scripts/content.js'] });
+      await scripting.executeScript({
+        target: { tabId },
+        files: ['content-scripts/content.js'],
+      });
       return await ask();
     } catch {
       throw new Error(
@@ -292,6 +321,21 @@ export default function App() {
   const ttsReadyRef = useRef(false);
   const ttsDownloadingRef = useRef(false);
   const speakingIdxRef = useRef<number | null>(null);
+  // Voice input (Moonshine STT + Silero VAD). The speech model downloads once on first use.
+  // `voiceState` drives the hands-free loop (off → listening → speech → transcribing → thinking
+  // → speaking → listening); `pttActive` is the separate push-to-talk mic button.
+  const [voiceState, setVoiceState] = useState<VoiceState>('off');
+  const voiceStateRef = useRef<VoiceState>('off');
+  const [sttReady, setSttReady] = useState(false);
+  const sttReadyRef = useRef(false);
+  const [sttDownloading, setSttDownloading] = useState(false);
+  const [sttDownloadPct, setSttDownloadPct] = useState(0);
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [pttActive, setPttActive] = useState(false);
+  const pttActiveRef = useRef(false);
+  /** Which control is mid-first-download (drives its inline % label). */
+  const [voiceLoading, setVoiceLoading] = useState<null | 'ptt' | 'voice'>(null);
+  const voiceSessionRef = useRef<SttSession | null>(null);
   const suggestedModelId = defaultModelForDevice();
   /** The model card is the one place downloads happen: it shows whenever the selected
    *  model's weights aren't on disk — on first run and mid-chat alike. */
@@ -425,6 +469,9 @@ export default function App() {
     const port = browser.runtime.connect({ name: PORT_NAME });
     port.onDisconnect.addListener(() => {
       if (portRef.current === port) portRef.current = null;
+      // The offscreen doc (and its mic capture) is gone — drop any voice session so the UI
+      // doesn't show a live indicator for a mic that's no longer running.
+      resetVoiceState();
     });
     portRef.current = port;
     return port;
@@ -434,11 +481,12 @@ export default function App() {
   async function releaseModel() {
     cancelScheduledPreload();
     const epoch = beginEngineOp();
-    // Closing the offscreen doc destroys the TTS worker too — reset so the next Speak reloads.
+    // Closing the offscreen doc destroys the TTS + STT workers too — reset so the next use reloads.
     ttsReadyRef.current = false;
     setTtsReady(false);
     setSpeakingIdx(null);
     speakingIdxRef.current = null;
+    resetVoiceState();
     portRef.current?.disconnect();
     portRef.current = null;
     await releaseOffscreen();
@@ -567,7 +615,8 @@ export default function App() {
    *  and never gates the model card or status. */
   async function indexCurrentPage() {
     const s = settingsRef.current;
-    if (!webgpuAvailable() || abortRef.current) return;
+    // Page context off means the page is never read — not even for background indexing.
+    if (!s.pageContext || !webgpuAvailable() || abortRef.current) return;
     // Capture fails on restricted pages (chrome://, stores, or when no readable tab is
     // active) — that's fine, there's just nothing to index.
     let page: PageContent | null = null;
@@ -709,12 +758,228 @@ export default function App() {
     setTtsReady(false);
   }
 
+  // ---- Voice input (speech-to-text) ----
+
+  /** Set the hands-free voice state (keeping the ref in sync for stale-closure-free reads). */
+  function setVoice(next: VoiceState) {
+    voiceStateRef.current = next;
+    setVoiceState(next);
+  }
+
+  function dispatchVoice(action: Parameters<typeof voiceReducer>[1]) {
+    setVoice(voiceReducer(voiceStateRef.current, action));
+  }
+
+  /** Ensure the speech model is downloaded (once) and loaded. Mirrors speakMessage's TTS block. */
+  async function ensureSttReady(port: WebllmPort): Promise<boolean> {
+    if (sttReadyRef.current) return true;
+    setSttDownloading(true);
+    setSttDownloadPct(0);
+    try {
+      await sttLoad(port, (p) => setSttDownloadPct(Math.round(p * 100)));
+      sttReadyRef.current = true;
+      setSttReady(true);
+      return true;
+    } catch (e) {
+      setVoiceError(e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      setSttDownloading(false);
+    }
+  }
+
+  /** Confirm mic access, opening the one-time permission page (in a normal tab) if needed and
+   *  awaiting its result. getUserMedia can't prompt from the panel or the offscreen document. */
+  async function ensureMicPermission(): Promise<boolean> {
+    if ((await micPermissionState()) === 'granted') return true;
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (granted: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        browser.runtime.onMessage.removeListener(onMsg);
+        resolve(granted);
+      };
+      const onMsg = (m: unknown) => {
+        const msg = m as { type?: string; granted?: boolean };
+        if (msg?.type === 'MIC_PERMISSION_RESULT') finish(!!msg.granted);
+      };
+      // Give up (as denied) if the user abandons the page without choosing.
+      const timer = setTimeout(async () => {
+        finish((await micPermissionState()) === 'granted');
+      }, 120_000);
+      browser.runtime.onMessage.addListener(onMsg);
+      void openMicPermissionPage();
+    });
+  }
+
+  /** Push-to-talk: click to start capturing, click again to stop + transcribe. The transcript
+   *  either fills the composer (default) or is submitted (Settings → voiceAutoSend). */
+  async function togglePtt() {
+    if (voiceStateRef.current !== 'off') return; // hands-free mode owns the mic
+    if (pttActiveRef.current) {
+      voiceSessionRef.current?.stop(true);
+      return;
+    }
+    setVoiceError(null);
+    setVoiceLoading('ptt');
+    try {
+      if (!(await ensureMicPermission())) {
+        setVoiceError('Microphone access is needed for voice input. Allow it and try again.');
+        return;
+      }
+      const port = await getWebllmPort();
+      if (!(await ensureSttReady(port))) return;
+      pttActiveRef.current = true;
+      setPttActive(true);
+      voiceSessionRef.current = sttStartListening(port, {
+        mode: 'ptt',
+        onTranscript: (text) => onPttTranscript(text),
+        onError: (e) => setVoiceError(e.message),
+        onStopped: () => {
+          pttActiveRef.current = false;
+          setPttActive(false);
+          voiceSessionRef.current = null;
+        },
+      });
+    } finally {
+      setVoiceLoading(null);
+    }
+  }
+
+  function onPttTranscript(text: string) {
+    const t = text.trim();
+    if (!t) return;
+    if (settingsRef.current.voiceAutoSend) void submit(t);
+    else setInput((prev) => (prev.trim() ? `${prev.trim()} ${t}` : t));
+  }
+
+  /** Toggle hands-free voice mode. On: confirm mic, load STT + TTS (the loop speaks replies),
+   *  then start an auto-endpointing listening session. Off: end the session and stop speaking. */
+  async function toggleVoiceMode() {
+    if (voiceStateRef.current !== 'off') {
+      stopVoiceMode();
+      return;
+    }
+    setVoiceError(null);
+    setVoiceLoading('voice');
+    try {
+      if (!(await ensureMicPermission())) {
+        setVoiceError('Microphone access is needed for voice mode. Allow it and try again.');
+        return;
+      }
+      const port = await getWebllmPort();
+      if (!(await ensureSttReady(port))) return;
+      // The loop reads replies aloud, so make sure the TTS voice is loaded too.
+      if (!ttsReadyRef.current) {
+        setTtsDownloading(true);
+        ttsDownloadingRef.current = true;
+        setTtsDownloadPct(0);
+        try {
+          await ttsLoad(port, (p) => setTtsDownloadPct(Math.round(p * 100)));
+          ttsReadyRef.current = true;
+          setTtsReady(true);
+        } catch (e) {
+          setVoiceError(e instanceof Error ? e.message : String(e));
+          return;
+        } finally {
+          setTtsDownloading(false);
+          ttsDownloadingRef.current = false;
+        }
+      }
+      setVoice('listening');
+      voiceSessionRef.current = sttStartListening(port, {
+        mode: 'auto',
+        onState: (s) => dispatchVoice({ type: 'sttState', state: s }),
+        onTranscript: (text) => void onVoiceTranscript(text),
+        onError: (e) => setVoiceError(e.message),
+        onStopped: () => {
+          voiceSessionRef.current = null;
+          // Session ended offscreen (mic failure, worker teardown) — don't leave the loop UI up.
+          if (voiceStateRef.current !== 'off') setVoice('off');
+        },
+      });
+    } finally {
+      setVoiceLoading(null);
+    }
+  }
+
+  function stopVoiceMode() {
+    setVoice('off');
+    voiceSessionRef.current?.stop();
+    voiceSessionRef.current = null;
+    stopSpeaking();
+  }
+
+  /** A hands-free utterance was transcribed: mute the mic (echo guard) and send it to the LLM.
+   *  submit() drives the reply back to 'speaking' → 'listening'. */
+  async function onVoiceTranscript(text: string) {
+    if (voiceStateRef.current === 'off' || abortRef.current) return;
+    const t = text.trim();
+    if (!t) {
+      dispatchVoice({ type: 'resume' });
+      return;
+    }
+    if (portRef.current) sttMute(portRef.current, true);
+    dispatchVoice({ type: 'transcript' }); // → thinking
+    await submit(t, { fromVoice: true });
+  }
+
+  /** After a hands-free reply generates: speak it (forced), then resume listening. Any empty /
+   *  errored / aborted path resumes too, so the loop is never stranded in 'thinking'. */
+  function handleVoiceReply(idx: number, text: string | null) {
+    if (voiceStateRef.current === 'off') return;
+    if (text && text.trim()) {
+      dispatchVoice({ type: 'speak' });
+      void speakMessage(idx, text).finally(resumeVoiceListening);
+    } else {
+      resumeVoiceListening();
+    }
+  }
+
+  function resumeVoiceListening() {
+    if (voiceStateRef.current === 'off') return;
+    if (portRef.current) sttMute(portRef.current, false);
+    dispatchVoice({ type: 'resume' }); // → listening
+  }
+
+  /** Reset all voice/STT state (offscreen doc gone or model released). */
+  function resetVoiceState() {
+    voiceSessionRef.current = null;
+    pttActiveRef.current = false;
+    setPttActive(false);
+    setVoice('off');
+    sttReadyRef.current = false;
+    setSttReady(false);
+  }
+
+  /** Free the speech model from memory (Settings). Next voice use reloads it. */
+  function releaseVoiceInput() {
+    stopVoiceMode();
+    if (portRef.current) sttRelease(portRef.current);
+    sttReadyRef.current = false;
+    setSttReady(false);
+  }
+
   async function submit(
     text: string,
-    opts?: { selectionOverride?: string; task?: TaskSpec; schema?: ExtractionSchema },
+    opts?: {
+      selectionOverride?: string;
+      task?: TaskSpec;
+      schema?: ExtractionSchema;
+      fromVoice?: boolean;
+    },
   ) {
     const trimmed = text.trim();
-    if (!trimmed || streaming) return;
+    // abortRef (a ref, never stale) backs up the `streaming` state check: voice transcripts
+    // arrive via long-lived port listeners whose captured `streaming` is frozen at registration
+    // time, so a transcript landing mid-generation would otherwise slip past the guard.
+    if (!trimmed || streaming || abortRef.current) {
+      // A voice utterance that can't be sent right now must still release the loop.
+      if (opts?.fromVoice) resumeVoiceListening();
+      return;
+    }
 
     // A new question interrupts any speech from the previous reply.
     stopSpeaking();
@@ -724,6 +989,9 @@ export default function App() {
     const conversation: ChatMessage[] = [...messagesRef.current, { role: 'user', content: trimmed }];
     // Index of the assistant reply we're about to stream (for auto-read on completion).
     const assistantIdx = conversation.length;
+    // In hands-free voice mode we speak this reply ourselves (forced) and resume listening — so
+    // capture the final text here instead of letting autoRead speak it on the ttsAutoRead setting.
+    let voiceReplyText: string | null = null;
     shouldAutoScrollRef.current = true;
     setMessages([...conversation, { role: 'assistant', content: '' }]);
     setInput('');
@@ -739,105 +1007,121 @@ export default function App() {
       if (!webgpuAvailable()) {
         throw new Error('This browser has no WebGPU. Use a recent Chromium browser (Chrome, Edge, or Brave).');
       }
-      setPageNote('Reading page…');
-      const page = await withTimeout(
-        capturePage(s.viewportBoost),
-        PAGE_CAPTURE_TIMEOUT_MS,
-        'This page took too long to read. Heavy, app-like pages can do this — select the relevant text and try again.',
-      );
-      if (controller.signal.aborted) {
-        setLastAssistant('_(stopped)_');
-        return;
-      }
-      if (opts?.selectionOverride && !page.selection.trim()) {
-        page.selection = opts.selectionOverride;
-      }
-      setPageNote('Preparing page context…');
       const runtimeCtx = contextForSettings(s);
       const model = webllmModel(s.webllmModel);
-      const budget = pageBudgetTokens(s, page, conversation, runtimeCtx, spec.systemPrompt || undefined);
-      // The body a single prompt may carry: the context-window budget, hard-capped per model.
-      // Big models get SMALLER prompts — one oversized prefill on an integrated GPU can starve
-      // the OS compositor and take down the whole session (see docs/large-page-handling.md).
-      const bodyBudget = Math.min(budget, model.safePromptTokens);
       const sysOverride = spec.systemPrompt || undefined;
-      // Retrieve from (rather than truncate) the page whenever the task allows it and the page
-      // overflows what this model can safely take in one prompt. A selection no longer disables
-      // retrieval — it sharpens the query instead (the selection itself rides in the header).
-      const useRag = spec.allowRag && estimateTokens(page.textContent) > bodyBudget;
-
+      // Page context toggled off: nothing from the tab is captured or sent — the prompt is
+      // just the system scaffold plus the conversation.
+      let page: PageContent | null = null;
       let built: BuiltPrompt;
-      if (useRag) {
-        const port = await getWebllmPort();
-        const chunks = chunkPage(page);
-        const hash = hashText(page.textContent);
-        setPageNote('Indexing page for retrieval…');
-        await indexPage(port, page.url, hash, chunks, (p) => {
-          if (engineOpCurrent(epoch)) setLoadProgress(p);
+      if (!s.pageContext) {
+        built = buildMessages(s, null, conversation, runtimeCtx, {
+          systemPromptOverride: sysOverride,
         });
-        if (engineOpCurrent(epoch)) setLoadProgress(null);
+      } else {
+        setPageNote('Reading page…');
+        page = await withTimeout(
+          capturePage(s.viewportBoost),
+          PAGE_CAPTURE_TIMEOUT_MS,
+          'This page took too long to read. Heavy, app-like pages can do this — select the relevant text and try again.',
+        );
         if (controller.signal.aborted) {
           setLastAssistant('_(stopped)_');
           return;
         }
-        setPageNote('Finding the most relevant sections…');
-        const topK = Math.max(3, Math.min(8, Math.floor(bodyBudget / 350)));
-        // Extraction retrieves against its instruction; a question retrieves against itself,
-        // sharpened by any selected text.
-        const selection = page.selection.trim();
-        const query =
-          spec.kind === 'extract' && opts?.schema
-            ? opts.schema.instruction
-            : selection
-              ? `${trimmed}\n\nSelected text: ${selection.slice(0, 600)}`
-              : trimmed;
-        // Over-fetch when boosting so on-screen chunks can rise into the final top-k.
-        const fetchK = s.viewportBoost ? Math.min(topK * 2, 16) : topK;
-        let results = await retrieveChunks(port, page.url, hash, query, fetchK);
-        if (controller.signal.aborted) {
-          setLastAssistant('_(stopped)_');
-          return;
+        if (opts?.selectionOverride && !page.selection.trim()) {
+          page.selection = opts.selectionOverride;
         }
-        if (s.viewportBoost && page.viewportText) {
-          const vp = page.viewportText.toLowerCase();
-          results = results
-            .map((r) => {
-              const probe = r.text.replace(/\s+/g, ' ').trim().slice(0, 40).toLowerCase();
-              return probe.length > 8 && vp.includes(probe) ? { ...r, score: r.score * 1.15 } : r;
-            })
-            .sort((a, b) => b.score - a.score);
-        }
-        results = results.slice(0, topK);
-        if (s.compressContext && results.length) {
-          setPageNote('Compressing context…');
-          try {
-            const compressed = await compressTexts(port, results.map((r) => r.text), 0.5);
-            results = results.map((r, i) => ({ ...r, text: compressed[i] ?? r.text }));
-          } catch {
-            /* compression unavailable — proceed with the uncompressed chunks */
-          }
+        setPageNote('Preparing page context…');
+        const budget = pageBudgetTokens(s, page, conversation, runtimeCtx, spec.systemPrompt || undefined);
+        // The body a single prompt may carry: the context-window budget, hard-capped per model.
+        // Big models get SMALLER prompts — one oversized prefill on an integrated GPU can starve
+        // the OS compositor and take down the whole session (see docs/large-page-handling.md).
+        const bodyBudget = Math.min(budget, model.safePromptTokens);
+        // Retrieve from (rather than truncate) the page whenever the task allows it and the page
+        // overflows what this model can safely take in one prompt. A selection no longer disables
+        // retrieval — it sharpens the query instead (the selection itself rides in the header).
+        const useRag = spec.allowRag && estimateTokens(page.textContent) > bodyBudget;
+
+        if (useRag) {
+          const port = await getWebllmPort();
+          const chunks = chunkPage(page);
+          const hash = hashText(page.textContent);
+          setPageNote('Indexing page for retrieval…');
+          await indexPage(port, page.url, hash, chunks, (p) => {
+            if (engineOpCurrent(epoch)) setLoadProgress(p);
+          });
+          if (engineOpCurrent(epoch)) setLoadProgress(null);
           if (controller.signal.aborted) {
             setLastAssistant('_(stopped)_');
             return;
           }
+          setPageNote('Finding the most relevant sections…');
+          const topK = Math.max(3, Math.min(8, Math.floor(bodyBudget / 350)));
+          // Extraction retrieves against its instruction; a question retrieves against itself,
+          // sharpened by any selected text.
+          const selection = page.selection.trim();
+          const query =
+            spec.kind === 'extract' && opts?.schema
+              ? opts.schema.instruction
+              : selection
+                ? `${trimmed}\n\nSelected text: ${selection.slice(0, 600)}`
+                : trimmed;
+          // Over-fetch when boosting so on-screen chunks can rise into the final top-k.
+          const fetchK = s.viewportBoost ? Math.min(topK * 2, 16) : topK;
+          let results = await retrieveChunks(port, page.url, hash, query, fetchK);
+          if (controller.signal.aborted) {
+            setLastAssistant('_(stopped)_');
+            return;
+          }
+          if (s.viewportBoost && page.viewportText) {
+            const vp = page.viewportText.toLowerCase();
+            results = results
+              .map((r) => {
+                const probe = r.text.replace(/\s+/g, ' ').trim().slice(0, 40).toLowerCase();
+                return probe.length > 8 && vp.includes(probe) ? { ...r, score: r.score * 1.15 } : r;
+              })
+              .sort((a, b) => b.score - a.score);
+          }
+          results = results.slice(0, topK);
+          if (s.compressContext && results.length) {
+            setPageNote('Compressing context…');
+            try {
+              const compressed = await compressTexts(
+                port,
+                results.map((r) => r.text),
+                0.5,
+              );
+              results = results.map((r, i) => ({
+                ...r,
+                text: compressed[i] ?? r.text,
+              }));
+            } catch {
+              /* compression unavailable — proceed with the uncompressed chunks */
+            }
+            if (controller.signal.aborted) {
+              setLastAssistant('_(stopped)_');
+              return;
+            }
+          }
+          built = buildMessages(s, page, conversation, runtimeCtx, {
+            retrieved: results,
+            systemPromptOverride: sysOverride,
+            maxBodyTokens: model.safePromptTokens,
+          });
+          setPageNote(null);
+        } else {
+          built = buildMessages(s, page, conversation, runtimeCtx, {
+            systemPromptOverride: sysOverride,
+            maxBodyTokens: model.safePromptTokens,
+          });
+          // Coverage is never narrated — the note strip only speaks while work is in flight.
+          setPageNote(spec.supportsMapReduce && built.truncated ? 'Preparing to summarize a long page…' : null);
         }
-        built = buildMessages(s, page, conversation, runtimeCtx, {
-          retrieved: results,
-          systemPromptOverride: sysOverride,
-          maxBodyTokens: model.safePromptTokens,
-        });
-        setPageNote(null);
-      } else {
-        built = buildMessages(s, page, conversation, runtimeCtx, {
-          systemPromptOverride: sysOverride,
-          maxBodyTokens: model.safePromptTokens,
-        });
-        // Coverage is never narrated — the note strip only speaks while work is in flight.
-        setPageNote(spec.supportsMapReduce && built.truncated ? 'Preparing to summarize a long page…' : null);
       }
 
       // A large page under the summarize task is handled by map-reduce, not truncation.
-      const useMapReduce = spec.supportsMapReduce && built.truncated;
+      const useMapReduce = page != null && spec.supportsMapReduce && built.truncated;
 
       const port = await getWebllmPort();
       if (engineOpCurrent(epoch)) setModelStatus((cur) => (cur === 'ready' ? cur : 'loading'));
@@ -862,16 +1146,22 @@ export default function App() {
         return;
       }
 
-      const genOptions: GenerateOptions = { temperature: resolveTemperature(spec, s), maxTokens: spec.maxTokens };
+      const genOptions: GenerateOptions = {
+        temperature: resolveTemperature(spec, s),
+        maxTokens: spec.maxTokens,
+      };
       // Qwen3 models reason in hidden <think> blocks by default — the user just sees the
       // spinner while tokens they'll never read stream at decode speed. Hard-disable it for
       // every task via the chat-template flag (the soft "/no_think" text hint was unreliable).
       if (/Qwen3/i.test(s.webllmModel)) genOptions.enableThinking = false;
       if (spec.outputMode === 'json' && opts?.schema) {
-        genOptions.responseFormat = { type: 'json_object', schema: JSON.stringify(opts.schema.schema) };
+        genOptions.responseFormat = {
+          type: 'json_object',
+          schema: JSON.stringify(opts.schema.schema),
+        };
       }
 
-      if (useMapReduce) {
+      if (useMapReduce && page) {
         // Whole-page summary of an over-budget page: summarize sections, then merge.
         const chunks = chunkPage(page);
         const qwen = /Qwen3/i.test(s.webllmModel);
@@ -908,7 +1198,11 @@ export default function App() {
         };
         const summary = await summarizeChunks(
           chunks,
-          { ctxTokens: runtimeCtx, title: page.title || 'this page', maxPromptTokens: model.safePromptTokens },
+          {
+            ctxTokens: runtimeCtx,
+            title: page.title || 'this page',
+            maxPromptTokens: model.safePromptTokens,
+          },
           {
             runOne,
             onProgress: (p) => {
@@ -919,7 +1213,10 @@ export default function App() {
           },
         );
         setLastAssistant(summary || (controller.signal.aborted ? '_(stopped)_' : '_(no response)_'));
-        if (summary && !controller.signal.aborted) autoRead(assistantIdx, summary);
+        if (summary && !controller.signal.aborted) {
+          if (opts?.fromVoice) voiceReplyText = summary;
+          else autoRead(assistantIdx, summary);
+        }
       } else if (spec.outputMode === 'json') {
         // Structured extraction: one non-streaming call, parse, store as a structured message.
         let raw: string;
@@ -964,7 +1261,10 @@ export default function App() {
           setLastAssistant(acc);
         }
         if (!acc) setLastAssistant(controller.signal.aborted ? '_(stopped)_' : '_(no response)_');
-        else if (!controller.signal.aborted) autoRead(assistantIdx, acc);
+        else if (!controller.signal.aborted) {
+          if (opts?.fromVoice) voiceReplyText = acc;
+          else autoRead(assistantIdx, acc);
+        }
       }
     } catch (e) {
       if (controller.signal.aborted) {
@@ -986,6 +1286,8 @@ export default function App() {
       setPageNote(null);
       abortRef.current = null;
       endEngineOp(epoch);
+      // Hands-free loop: speak the reply (or just resume) — never leave it stuck in 'thinking'.
+      if (opts?.fromVoice) handleVoiceReply(assistantIdx, voiceReplyText);
     }
   }
 
@@ -999,7 +1301,10 @@ export default function App() {
       if (!page.selection.trim()) {
         setMessages((prev) => [
           ...prev,
-          { role: 'assistant', content: 'Select some text on the page first, then click “Explain selection”.' },
+          {
+            role: 'assistant',
+            content: 'Select some text on the page first, then click “Explain selection”.',
+          },
         ]);
         return;
       }
@@ -1095,6 +1400,8 @@ export default function App() {
           busy={streaming}
           ttsLoaded={ttsReady}
           onReleaseVoice={releaseVoiceModel}
+          sttLoaded={sttReady}
+          onReleaseVoiceInput={releaseVoiceInput}
         />
       )}
 
@@ -1111,6 +1418,33 @@ export default function App() {
           <span>Voice: {ttsError}</span>
           <button className="shrink-0 underline" onClick={() => setTtsError(null)}>
             Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Voice input error (mic permission / speech model) */}
+      {voiceError && (
+        <div className="flex items-center justify-between gap-2 border-b border-amber-200 bg-amber-50 px-3 py-1.5 text-[11px] text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
+          <span>Voice input: {voiceError}</span>
+          <button className="shrink-0 underline" onClick={() => setVoiceError(null)}>
+            Dismiss
+          </button>
+        </div>
+      )}
+
+      {/* Hands-free voice-mode status strip */}
+      {voiceState !== 'off' && (
+        <div className="flex items-center gap-2 border-b border-indigo-200 bg-indigo-50 px-3 py-1.5 text-[11px] text-indigo-700 dark:border-indigo-900 dark:bg-indigo-950/40 dark:text-indigo-300">
+          <span className="relative flex h-2 w-2">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-indigo-400 opacity-75" />
+            <span className="relative inline-flex h-2 w-2 rounded-full bg-indigo-500" />
+          </span>
+          <span>{VOICE_STATE_LABEL[voiceState]}</span>
+          <button
+            className="ml-auto shrink-0 rounded border border-indigo-300 px-2 py-0.5 hover:bg-indigo-100 dark:border-indigo-700 dark:hover:bg-indigo-900/40"
+            onClick={toggleVoiceMode}
+          >
+            End
           </button>
         </div>
       )}
@@ -1186,28 +1520,34 @@ export default function App() {
       </div>
 
       {/* Quick actions */}
-      <div className="flex flex-wrap gap-2 border-t border-zinc-200 bg-white px-3 pt-2 dark:border-zinc-800 dark:bg-zinc-900">
+      <div className="flex flex-wrap items-center gap-2 border-t border-zinc-200 bg-white px-3 pt-2 dark:border-zinc-800 dark:bg-zinc-900">
         <button
           className="rounded-full border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:hover:bg-zinc-800"
-          disabled={disabled}
+          disabled={disabled || !settings.pageContext}
+          title={settings.pageContext ? undefined : 'Turn page context on to use this'}
           onClick={() => submit(TASKS.summarize.label, { task: TASKS.summarize })}
         >
           Summarize
         </button>
         <button
           className="rounded-full border border-zinc-300 px-3 py-1 text-xs hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:hover:bg-zinc-800"
-          disabled={disabled}
+          disabled={disabled || !settings.pageContext}
+          title={settings.pageContext ? undefined : 'Turn page context on to use this'}
           onClick={explainSelection}
         >
           Explain selection
         </button>
         <select
           className="rounded-full border border-zinc-300 px-2 py-1 text-xs hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800"
-          disabled={disabled}
+          disabled={disabled || !settings.pageContext}
           value=""
           onChange={(e) => {
             const schema = EXTRACTION_SCHEMAS.find((x) => x.id === e.target.value);
-            if (schema) submit(extractTask(schema).label, { task: extractTask(schema), schema });
+            if (schema)
+              submit(extractTask(schema).label, {
+                task: extractTask(schema),
+                schema,
+              });
           }}
           title="Extract structured data as JSON"
         >
@@ -1218,13 +1558,40 @@ export default function App() {
             </option>
           ))}
         </select>
+        {/* Page-context gate: when off, NOTHING from the tab (title, URL, selection, text)
+            is read or sent to the local model. */}
+        <button
+          type="button"
+          className={
+            'ml-auto rounded-full border px-3 py-1 text-xs disabled:opacity-40 ' +
+            (settings.pageContext
+              ? 'border-indigo-300 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 dark:border-indigo-500/50 dark:bg-indigo-500/15 dark:text-indigo-300 dark:hover:bg-indigo-500/25'
+              : 'border-amber-300 bg-amber-50 text-amber-700 hover:bg-amber-100 dark:border-amber-500/50 dark:bg-amber-500/15 dark:text-amber-300 dark:hover:bg-amber-500/25')
+          }
+          disabled={composerLocked}
+          aria-pressed={settings.pageContext}
+          title={
+            settings.pageContext
+              ? 'Page context is ON — this tab’s content is included in what the local model reads. Click to keep the page private.'
+              : 'Page context is OFF — nothing from this tab is sent to the model. Click to include the page again.'
+          }
+          onClick={() => void onSaveSettings({ pageContext: !settings.pageContext })}
+        >
+          {settings.pageContext ? '📄 Page: on' : '🔒 Page: off'}
+        </button>
       </div>
 
       {/* Composer */}
       <div className="flex items-end gap-2 bg-white px-3 pt-2 pb-3 dark:bg-zinc-900">
         <textarea
           className="max-h-32 min-h-[2.5rem] flex-1 resize-none rounded border border-zinc-300 px-2 py-1.5 text-sm focus:border-zinc-400 focus:outline-none disabled:cursor-not-allowed disabled:bg-zinc-100 disabled:text-zinc-400 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:placeholder-zinc-500 dark:focus:border-zinc-500 dark:disabled:bg-zinc-800/60 dark:disabled:text-zinc-500"
-          placeholder={composerLocked ? 'Download the model to start chatting…' : 'Ask about this page…'}
+          placeholder={
+            composerLocked
+              ? 'Download the model to start chatting…'
+              : settings.pageContext
+                ? 'Ask about this page…'
+                : 'Ask anything — page context is off…'
+          }
           rows={1}
           value={input}
           disabled={composerLocked}
@@ -1236,6 +1603,47 @@ export default function App() {
             }
           }}
         />
+        {/* Push-to-talk mic */}
+        <button
+          type="button"
+          onClick={() => void togglePtt()}
+          disabled={composerLocked || voiceState !== 'off' || voiceLoading !== null}
+          title={pttActive ? 'Stop recording' : 'Push to talk — record a message'}
+          aria-label={pttActive ? 'Stop recording' : 'Push to talk'}
+          className={
+            'rounded px-3 py-2 text-sm tabular-nums ' +
+            (pttActive
+              ? 'bg-red-600 text-white hover:bg-red-500'
+              : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300 disabled:opacity-40 dark:bg-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-600')
+          }
+        >
+          {voiceLoading === 'ptt' ? (sttDownloading ? `${sttDownloadPct}%` : '…') : pttActive ? '■' : '🎤'}
+        </button>
+        {/* Hands-free voice mode */}
+        <button
+          type="button"
+          onClick={() => void toggleVoiceMode()}
+          disabled={composerLocked || pttActive || voiceLoading !== null}
+          title={
+            voiceState !== 'off' ? 'Turn off voice mode' : 'Hands-free voice mode — talk, and hear replies read back'
+          }
+          aria-label="Toggle hands-free voice mode"
+          aria-pressed={voiceState !== 'off'}
+          className={
+            'rounded px-3 py-2 text-sm tabular-nums ' +
+            (voiceState !== 'off'
+              ? 'bg-indigo-600 text-white hover:bg-indigo-500'
+              : 'bg-zinc-200 text-zinc-700 hover:bg-zinc-300 disabled:opacity-40 dark:bg-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-600')
+          }
+        >
+          {voiceLoading === 'voice'
+            ? sttDownloading
+              ? `${sttDownloadPct}%`
+              : ttsDownloading
+                ? `${ttsDownloadPct}%`
+                : '…'
+            : '🎧'}
+        </button>
         {streaming ? (
           <button
             className="rounded bg-zinc-200 px-3 py-2 text-sm hover:bg-zinc-300 dark:bg-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-600"
@@ -1434,6 +1842,8 @@ function SettingsPanel({
   busy,
   ttsLoaded,
   onReleaseVoice,
+  sttLoaded,
+  onReleaseVoiceInput,
 }: {
   settings: Settings;
   onSave: (patch: Partial<Settings>) => void;
@@ -1441,6 +1851,8 @@ function SettingsPanel({
   busy: boolean;
   ttsLoaded: boolean;
   onReleaseVoice: () => void;
+  sttLoaded: boolean;
+  onReleaseVoiceInput: () => void;
 }) {
   const inputCls = 'rounded border border-zinc-300 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100';
   const maxCtx = Math.min(webllmModel(settings.webllmModel).maxCtx, MAX_CONTEXT_TOKENS);
@@ -1496,7 +1908,9 @@ function SettingsPanel({
           onChange={(e) => {
             const value = Number(e.target.value);
             if (!Number.isFinite(value)) return;
-            onSave({ webllmCtx: Math.max(MIN_CONTEXT_TOKENS, Math.min(maxCtx, value || DEFAULT_SETTINGS.webllmCtx)) });
+            onSave({
+              webllmCtx: Math.max(MIN_CONTEXT_TOKENS, Math.min(maxCtx, value || DEFAULT_SETTINGS.webllmCtx)),
+            });
           }}
         />
         <p className="mt-1 text-[10px] text-zinc-400">
@@ -1565,6 +1979,37 @@ function SettingsPanel({
         .
       </p>
 
+      <label className="flex items-center gap-2">
+        <input
+          type="checkbox"
+          checked={settings.voiceAutoSend}
+          onChange={(e) => onSave({ voiceAutoSend: e.target.checked })}
+        />
+        <span className="text-zinc-500 dark:text-zinc-400">Send push-to-talk messages automatically</span>
+      </label>
+      <p className="-mt-1 text-[10px] text-zinc-400">
+        Off: the mic (🎤) drops your words into the composer to edit first. On: it sends them right away. Hands-free
+        voice mode (🎧) always sends and reads replies back. Speech recognition runs on-device with{' '}
+        <a
+          href="https://huggingface.co/UsefulSensors/moonshine"
+          target="_blank"
+          rel="noreferrer"
+          className="underline hover:text-zinc-600 dark:hover:text-zinc-300"
+        >
+          Moonshine
+        </a>{' '}
+        (English, ~{STT_DOWNLOAD_MB} MB, downloaded once) and{' '}
+        <a
+          href="https://github.com/snakers4/silero-vad"
+          target="_blank"
+          rel="noreferrer"
+          className="underline hover:text-zinc-600 dark:hover:text-zinc-300"
+        >
+          Silero VAD
+        </a>
+        , both MIT-licensed.
+      </p>
+
       <div className="flex flex-col gap-2">
         <button
           type="button"
@@ -1581,6 +2026,15 @@ function SettingsPanel({
             className="rounded border border-zinc-300 bg-white px-2 py-1 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
           >
             Release voice model from memory
+          </button>
+        )}
+        {sttLoaded && (
+          <button
+            type="button"
+            onClick={onReleaseVoiceInput}
+            className="rounded border border-zinc-300 bg-white px-2 py-1 hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
+          >
+            Release voice-input model from memory
           </button>
         )}
       </div>

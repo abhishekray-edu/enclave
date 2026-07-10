@@ -73,12 +73,18 @@ export interface Settings {
   temperature: number;
   /** Hidden system prompt prepended to every conversation. */
   systemPrompt: string;
+  /** Send the current tab's content (title, URL, selection, text) with each question. Off:
+   *  questions reach the model with no page data at all. */
+  pageContext: boolean;
   /** Compress retrieved context with LLMLingua-2 before sending (experimental; off by default). */
   compressContext: boolean;
   /** Boost retrieved chunks currently visible in the viewport (experimental; off by default). */
   viewportBoost: boolean;
   /** Read each new assistant reply aloud automatically when it finishes (off by default). */
   ttsAutoRead: boolean;
+  /** Push-to-talk transcripts are auto-submitted (true) vs dropped into the composer to edit
+   *  (false, default). Hands-free voice mode always auto-submits regardless of this. */
+  voiceAutoSend: boolean;
 }
 
 export const SYSTEM_PROMPT =
@@ -90,9 +96,11 @@ export const DEFAULT_SETTINGS: Settings = {
   webllmCtx: DEFAULT_CONTEXT_TOKENS,
   temperature: 0.3,
   systemPrompt: SYSTEM_PROMPT,
+  pageContext: true,
   compressContext: false,
   viewportBoost: false,
   ttsAutoRead: false,
+  voiceAutoSend: false,
 };
 
 // ---- Messaging protocol (runtime.sendMessage) ----

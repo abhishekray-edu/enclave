@@ -39,6 +39,9 @@ It's a Chrome **side-panel** extension: open it beside any tab and chat about wh
 - **Structured extraction** — pull article metadata, key facts, or contacts as JSON, with
   schema-constrained decoding (valid JSON by construction).
 - **Quick actions** — Ask, Summarize, Explain a selection (also via right-click), Extract.
+- **Talk to it** — push-to-talk (🎤) or hands-free voice mode (🎧): speak your question and hear
+  the reply read back. Speech recognition (Moonshine) and voice-activity detection (Silero VAD)
+  run on-device — the microphone audio never leaves your machine.
 - **Fast when it matters** — the page is indexed and any already-downloaded model staged as
   soon as the panel opens, and the model stays resident across panel open/close for instant
   follow-ups. Downloads only ever start when you ask for them.
@@ -146,8 +149,10 @@ tests. The research notes and the post-mortem behind those caps live in
   walk that crosses shadow DOM and same-origin iframes) with document structure and the selection.
 - **`entrypoints/sidepanel/`** — the React UI: chat, task routing, prompt building, markdown rendering.
 - **`entrypoints/offscreen/`** — hosts the models in a persistent hidden document so they stay
-  loaded across panel open/close. The LLM and the embedding/compression models each run in their
-  own dedicated worker, so the UI never blocks on model work.
+  loaded across panel open/close. The LLM, the embedding/compression models, the text-to-speech
+  voice, and the speech-to-text (Moonshine + Silero VAD) engine each run in their own dedicated
+  worker, so the UI never blocks on model work. The document also captures the microphone and
+  plays synthesized speech.
 - **`entrypoints/background.ts`** — thin glue: panel behavior, keyboard command, context menu,
   and offscreen-document lifecycle.
 - **`lib/`** — the pipeline: `prompt.ts` (context-budgeted prompt builder), `chunking.ts`

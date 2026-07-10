@@ -51,6 +51,19 @@ describe('buildMessages — full (small page)', () => {
   });
 });
 
+describe('buildMessages — page context off (page: null)', () => {
+  it('sends nothing from the page — no title, URL, or content sections', () => {
+    const built = buildMessages(DEFAULT_SETTINGS, null, [{ role: 'user', content: 'q' }], 8192);
+    const system = built.messages[0].content;
+    expect(built.truncated).toBe(false);
+    expect(system).not.toContain('PAGE CONTEXT');
+    expect(system).not.toContain('PAGE CONTENT');
+    expect(system).not.toContain('example.com');
+    expect(system).toContain('Page context is turned off');
+    expect(built.messages).toHaveLength(2);
+  });
+});
+
 describe('buildMessages — structure-aware truncation (large page)', () => {
   it('keeps leading whole sections, drops trailing ones, never deletes the middle of a kept block', () => {
     const p = page({
