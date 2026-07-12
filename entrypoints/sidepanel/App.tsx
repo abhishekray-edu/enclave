@@ -51,9 +51,11 @@ import {
   SettingsIcon,
   FileTextIcon,
   LockIcon,
+  PaperclipIcon,
   PlayIcon,
   StopIcon,
   AlertTriangleIcon,
+  XIcon,
 } from './icons';
 import { applyTheme } from '@/lib/theme';
 import {
@@ -149,6 +151,82 @@ async function capturePage(wantViewport = false): Promise<PageContent> {
       );
     }
   }
+}
+
+// ---- Attachments: images (vision model only) and text files (any model) staged in the
+//      composer, sent with the next free-form question. ----
+interface Attachment {
+  kind: 'image' | 'text';
+  name: string;
+  /** kind 'image': downscaled JPEG data URL, ready for the engine's image_url part. */
+  dataUrl?: string;
+  /** kind 'text': file contents (storage-capped; prompt-capped again per model at send). */
+  text?: string;
+}
+
+/** Letterbox canvases with aspect ratios that are SAFE for Phi-3.5-vision. The engine
+ *  resizes every image by ASPECT RATIO alone — scaling it up to fill a grid of 336px tiles
+ *  (max 16) — and the whole image embedding must prefill in one indivisible chunk of the
+ *  compiled 2048-token budget. Square and 16:9 inputs blow it (2509 / 2353 tokens →
+ *  PrefillChunkSizeSmallerThanImageError). Each canvas's token cost is FIXED by its ratio
+ *  (pixel count is irrelevant); the attach path picks the closest ratio, which minimizes
+ *  both padding and prefill time — a phone screenshot on the 1:2 canvas costs 1357 tokens
+ *  (and lags visibly less) than it would on 3:4. */
+const VISION_CANVASES = [
+  { w: 1344, h: 1008, tokens: 1921 }, // 4:3 — near-square and most landscape images
+  { w: 1680, h: 672, tokens: 1621 }, // 5:2 — ultrawide screenshots and banners
+  { w: 1008, h: 1344, tokens: 1933 }, // 3:4 — near-square portrait
+  { w: 672, h: 1344, tokens: 1357 }, // 1:2 — phone screenshots
+];
+/** Files per message (keeps the prompt reviewable; the token cap below is the real bound). */
+const MAX_ATTACHED_FILES = 4;
+/** Reject files over this size before reading them (likely not text at all). */
+const MAX_TEXT_FILE_BYTES = 2 * 1024 * 1024;
+/** Storage cap per file at attach time; the per-model token cap applies again at send. */
+const MAX_STORED_FILE_CHARS = 120_000;
+const TEXT_FILE_ACCEPT =
+  '.txt,.md,.markdown,.csv,.tsv,.json,.log,.xml,.yaml,.yml,.html,.css,.js,.jsx,.ts,.tsx,.py,.rb,.go,.rs,.java,.c,.h,.cpp,.sh,.toml,.ini,.sql';
+
+/** Decode an image file and letterbox it onto the nearest safe vision canvas, returning a
+ *  JPEG data URL. See VISION_CANVASES for why the ratio is forced. */
+async function imageFileToDataUrl(file: File): Promise<string> {
+  const bitmap = await createImageBitmap(file);
+  try {
+    const ratio = bitmap.width / bitmap.height;
+    // Least-padding canvas: minimize the ratio mismatch factor (always ≥ 1).
+    const mismatch = (c: { w: number; h: number }) => Math.max(ratio / (c.w / c.h), c.w / c.h / ratio);
+    let spec = VISION_CANVASES[0];
+    for (const c of VISION_CANVASES) if (mismatch(c) < mismatch(spec)) spec = c;
+    const { w, h } = spec;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas unavailable.');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, w, h);
+    const scale = Math.min(w / bitmap.width, h / bitmap.height);
+    const dw = Math.max(1, Math.round(bitmap.width * scale));
+    const dh = Math.max(1, Math.round(bitmap.height * scale));
+    ctx.drawImage(bitmap, Math.floor((w - dw) / 2), Math.floor((h - dh) / 2), dw, dh);
+    return canvas.toDataURL('image/jpeg', 0.85);
+  } finally {
+    bitmap.close();
+  }
+}
+
+/** Cap total attached-file text to the model's safe single-prefill budget (~4 chars/token,
+ *  matching estimateTokens) — one oversized prompt on a big model can stall the GPU past the
+ *  OS watchdog, the same hazard safePromptTokens guards the page body against. */
+function capAttachedFiles(files: { name: string; text: string }[], maxTokens: number): { name: string; text: string }[] {
+  let budget = maxTokens * 4;
+  return files.map((f) => {
+    const take = Math.max(0, budget);
+    budget -= f.text.length;
+    return f.text.length <= take
+      ? f
+      : { name: f.name, text: f.text.slice(0, take) + '\n…[file truncated to fit the model context]' };
+  });
 }
 
 /** Remove Qwen-style <think>…</think> reasoning from displayed output.
@@ -320,6 +398,9 @@ export default function App() {
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  /** Transient attach feedback (wrong type, too big, needs the vision model). */
+  const [attachNote, setAttachNote] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [pageNote, setPageNote] = useState<string | null>(null);
@@ -393,13 +474,17 @@ export default function App() {
   // Refs keep submit() free of stale closures (settings load async; pending action auto-runs).
   const settingsRef = useRef(settings);
   const messagesRef = useRef(messages);
+  const attachmentsRef = useRef(attachments);
   settingsRef.current = settings;
   messagesRef.current = messages;
+  attachmentsRef.current = attachments;
   onboardVoiceRef.current = onboardVoice;
   // Gate persisting paused models until the stored value has been loaded, so the initial
   // empty state never overwrites what's on disk.
   const pausedHydratedRef = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const attachNoteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const shouldAutoScrollRef = useRef(true);
 
@@ -1119,6 +1204,54 @@ export default function App() {
     setSttReady(false);
   }
 
+  /** Show a short-lived note under the attachment chips (wrong file type, size, model). */
+  function flashAttachNote(text: string) {
+    setAttachNote(text);
+    if (attachNoteTimerRef.current) clearTimeout(attachNoteTimerRef.current);
+    attachNoteTimerRef.current = setTimeout(() => setAttachNote(null), 6000);
+  }
+
+  /** Stage picked files: images are downscaled to data URLs (vision model only, one per
+   *  message — an image costs ~2k tokens of the vision build's 4k context); anything else
+   *  must read as text. Rejections surface as a transient note, never an error. */
+  async function addAttachments(list: FileList | null) {
+    if (!list?.length) return;
+    let next = [...attachmentsRef.current];
+    const visionOk = webllmModel(settingsRef.current.webllmModel).vision === true;
+    for (const file of Array.from(list)) {
+      if (file.type.startsWith('image/')) {
+        if (!visionOk) {
+          flashAttachNote('Images need the vision model — pick Phi 3.5 Vision in Settings.');
+          continue;
+        }
+        try {
+          const dataUrl = await imageFileToDataUrl(file);
+          // One image per message: a new pick replaces the previous one.
+          next = [...next.filter((a) => a.kind !== 'image'), { kind: 'image', name: file.name, dataUrl }];
+        } catch {
+          flashAttachNote(`Couldn't read ${file.name} as an image.`);
+        }
+      } else {
+        if (next.filter((a) => a.kind === 'text').length >= MAX_ATTACHED_FILES) {
+          flashAttachNote(`Up to ${MAX_ATTACHED_FILES} files per message.`);
+          break;
+        }
+        if (file.size > MAX_TEXT_FILE_BYTES) {
+          flashAttachNote(`${file.name} is too large — text files up to 2 MB.`);
+          continue;
+        }
+        try {
+          const text = await file.text();
+          if (text.includes('\0')) throw new Error('binary');
+          next = [...next, { kind: 'text', name: file.name, text: text.slice(0, MAX_STORED_FILE_CHARS) }];
+        } catch {
+          flashAttachNote(`${file.name} isn't readable text (PDFs and binaries aren't supported).`);
+        }
+      }
+    }
+    setAttachments(next);
+  }
+
   async function submit(
     text: string,
     opts?: {
@@ -1143,7 +1276,22 @@ export default function App() {
 
     const s = settingsRef.current;
     const spec = opts?.task ?? TASKS.ask;
-    const conversation: ChatMessage[] = [...messagesRef.current, { role: 'user', content: trimmed }];
+    // Attachments ride on free-form questions only — the quick actions are about the page.
+    const attached = spec.kind === 'ask' ? attachmentsRef.current : [];
+    const images = attached.filter((a) => a.kind === 'image' && a.dataUrl).map((a) => a.dataUrl!);
+    const files = capAttachedFiles(
+      attached.filter((a) => a.kind === 'text' && a.text != null).map((a) => ({ name: a.name, text: a.text! })),
+      webllmModel(s.webllmModel).safePromptTokens,
+    );
+    const conversation: ChatMessage[] = [
+      ...messagesRef.current,
+      {
+        role: 'user',
+        content: trimmed,
+        ...(images.length ? { images } : {}),
+        ...(files.length ? { files } : {}),
+      },
+    ];
     // Index of the assistant reply we're about to stream (for auto-read on completion).
     const assistantIdx = conversation.length;
     // In hands-free voice mode we speak this reply ourselves (forced) and resume listening — so
@@ -1155,6 +1303,7 @@ export default function App() {
     shouldAutoScrollRef.current = true;
     setMessages([...conversation, { role: 'assistant', content: '' }]);
     setInput('');
+    if (attached.length) setAttachments([]);
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -1177,7 +1326,9 @@ export default function App() {
         : baseSys;
       let page: PageContent | null = null;
       let built: BuiltPrompt;
-      if (s.pageContext) {
+      // An image turn skips page capture: the question is about the image, and on the vision
+      // build (4k context) the image embedding (~2k tokens) plus a page cannot fit anyway.
+      if (s.pageContext && !images.length) {
         setPageNote('Reading page…');
         try {
           page = await withTimeout(
@@ -1299,6 +1450,10 @@ export default function App() {
 
       // A large page under the summarize task is handled by map-reduce, not truncation.
       const useMapReduce = page != null && spec.supportsMapReduce && built.truncated;
+
+      // The image embeds + prefills as one indivisible GPU chunk (~1.4-1.9k tokens), so the
+      // wait before the first token is noticeably longer than a text turn — say why.
+      if (images.length) setPageNote('Analyzing image…');
 
       const port = await getWebllmPort();
       if (engineOpCurrent(epoch)) setModelStatus((cur) => (cur === 'ready' ? cur : 'loading'));
@@ -1480,6 +1635,7 @@ export default function App() {
           );
           if (next.done) break;
           const delta = next.value;
+          if (!receivedToken) setPageNote(null); // prefill (incl. image analysis) is done
           receivedToken = true;
           acc += delta;
           setLastAssistant(acc);
@@ -1765,7 +1921,25 @@ export default function App() {
               }
             >
               {isUser ? (
-                m.content
+                <>
+                  {m.images?.map((src, k) => (
+                    <img key={k} src={src} alt="Attached image" className="mb-1.5 max-h-44 max-w-full rounded" />
+                  ))}
+                  {m.files?.length ? (
+                    <div className="mb-1 flex flex-wrap gap-1">
+                      {m.files.map((f, k) => (
+                        <span
+                          key={`${f.name}-${k}`}
+                          className="inline-flex items-center gap-1 rounded-full bg-zinc-300/60 px-2 py-0.5 text-[11px] dark:bg-zinc-600/60"
+                        >
+                          <FileTextIcon size={11} />
+                          <span className="max-w-[10rem] truncate">{f.name}</span>
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                  {m.content}
+                </>
               ) : isPlaceholder ? (
                 <ThinkingIndicator />
               ) : m.error ? (
@@ -1888,8 +2062,81 @@ export default function App() {
         </button>
       </div>
 
+      {/* Attachments staged for the next message */}
+      {(attachments.length > 0 || attachNote) && (
+        <div className="bg-white px-3 pt-2 dark:bg-zinc-900">
+          {attachments.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              {attachments.map((a, i) =>
+                a.kind === 'image' ? (
+                  <span key={`${a.name}-${i}`} className="relative inline-block">
+                    <img
+                      src={a.dataUrl}
+                      alt={a.name}
+                      className="h-12 w-12 rounded border border-zinc-300 object-cover dark:border-zinc-700"
+                    />
+                    <button
+                      type="button"
+                      aria-label={`Remove ${a.name}`}
+                      title={`Remove ${a.name}`}
+                      className="absolute -top-1.5 -right-1.5 rounded-full bg-zinc-700 p-0.5 text-white hover:bg-zinc-600"
+                      onClick={() => setAttachments(attachments.filter((_, j) => j !== i))}
+                    >
+                      <XIcon size={10} />
+                    </button>
+                  </span>
+                ) : (
+                  <span
+                    key={`${a.name}-${i}`}
+                    className="inline-flex items-center gap-1 rounded-full border border-zinc-300 bg-zinc-100 px-2 py-0.5 text-[11px] text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                  >
+                    <FileTextIcon size={11} />
+                    <span className="max-w-[10rem] truncate">{a.name}</span>
+                    <button
+                      type="button"
+                      aria-label={`Remove ${a.name}`}
+                      className="hover:text-zinc-900 dark:hover:text-zinc-100"
+                      onClick={() => setAttachments(attachments.filter((_, j) => j !== i))}
+                    >
+                      <XIcon size={11} />
+                    </button>
+                  </span>
+                ),
+              )}
+            </div>
+          )}
+          {attachNote && <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">{attachNote}</p>}
+        </div>
+      )}
+
       {/* Composer */}
       <div className="flex items-end gap-2 bg-white px-3 pt-2 pb-3 dark:bg-zinc-900">
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          hidden
+          // Images are only offered when the selected model can see them; text files always.
+          accept={webllmModel(settings.webllmModel).vision ? `image/*,${TEXT_FILE_ACCEPT}` : TEXT_FILE_ACCEPT}
+          onChange={(e) => {
+            void addAttachments(e.target.files);
+            e.target.value = ''; // allow re-picking the same file
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          disabled={composerLocked}
+          title={
+            webllmModel(settings.webllmModel).vision
+              ? 'Attach images or text files to your question'
+              : 'Attach text files to your question (images need the vision model — pick Phi 3.5 Vision in Settings)'
+          }
+          aria-label="Attach files"
+          className="flex items-center justify-center rounded bg-zinc-200 px-3 py-2 text-sm text-zinc-700 hover:bg-zinc-300 disabled:opacity-40 dark:bg-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-600"
+        >
+          <PaperclipIcon size={16} />
+        </button>
         <textarea
           className="max-h-32 min-h-[2.5rem] flex-1 resize-none rounded border border-zinc-300 px-2 py-1.5 text-sm focus:border-zinc-400 focus:outline-none disabled:cursor-not-allowed disabled:bg-zinc-100 disabled:text-zinc-400 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100 dark:placeholder-zinc-500 dark:focus:border-zinc-500 dark:disabled:bg-zinc-800/60 dark:disabled:text-zinc-500"
           placeholder={

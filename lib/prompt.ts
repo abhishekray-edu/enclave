@@ -17,6 +17,27 @@ export function estimateTokens(text: string): number {
 /** Reserve this many tokens of the context window for the model's answer. */
 const ANSWER_RESERVE_TOKENS = 1024;
 
+/** Prompt cost of one conversation message: its text plus any attached file text (folded in
+ *  at the engine boundary — lib/webllm.ts). Image cost is added separately in
+ *  pageBudgetTokens: only the newest image-bearing message keeps its images. */
+function messageTokens(m: ChatMessage): number {
+  const files = m.files?.reduce((sum, f) => sum + estimateTokens(f.text) + 16, 0) ?? 0;
+  return estimateTokens(m.content) + files + 8;
+}
+
+/** Worst-case embed cost of a retained image (the 4:3 letterbox grid — see App.tsx
+ *  VISION_CANVASES). The turn that SENDS an image skips page context, but the image stays in
+ *  context for follow-ups (lib/webllm.ts toEngineMessages keeps the newest one), so a later
+ *  page-context turn must reserve for it or overflow the vision build's 4k window. */
+const IMAGE_EMBED_RESERVE_TOKENS = 1950;
+
+/** Embed tokens the retained images will cost this conversation (newest-bearing message
+ *  only, mirroring toEngineMessages). */
+function retainedImageTokens(conversation: ChatMessage[]): number {
+  const last = conversation.reduce((acc, m, i) => (m.images?.length ? i : acc), -1);
+  return last >= 0 ? conversation[last].images!.length * IMAGE_EMBED_RESERVE_TOKENS : 0;
+}
+
 function pageHeader(page: PageContent): string {
   const lines = [`Title: ${page.title || '(untitled)'}`, `URL: ${page.url}`];
   if (page.siteName) lines.push(`Site: ${page.siteName}`);
@@ -45,7 +66,8 @@ export function pageBudgetTokens(
   const systemBase = `${systemPrompt}\n\n--- PAGE CONTEXT ---\n${header}\n\n--- PAGE CONTENT ---\n`;
   const fixed =
     estimateTokens(systemBase) +
-    conversation.reduce((sum, m) => sum + estimateTokens(m.content) + 8, 0) +
+    conversation.reduce((sum, m) => sum + messageTokens(m), 0) +
+    retainedImageTokens(conversation) +
     ANSWER_RESERVE_TOKENS;
   return Math.max(0, ctxTokens - fixed);
 }

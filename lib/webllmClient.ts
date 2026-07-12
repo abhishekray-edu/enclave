@@ -22,6 +22,8 @@ export interface WebllmModelOption {
   safePromptTokens: number;
   /** Short tier note shown in the picker. */
   note: string;
+  /** Model can see images: user messages may carry image_url content parts. */
+  vision?: boolean;
 }
 
 /** RAM-tiered in-browser models — ids, memory, and per-model context caps verified
@@ -37,6 +39,10 @@ export const WEBLLM_MODELS: WebllmModelOption[] = [
   // caps are sized for tolerable freeze windows, not just crash safety. 4B at ~1536 tokens
   // keeps the single prefill slab (compiled chunk 2048) short even in Low Power Mode.
   { id: 'Qwen3-4B-q4f16_1-MLC', label: 'Qwen3 4B', approxGb: 3.4, maxCtx: 16384, safePromptTokens: 1536, note: 'Recommended' },
+  // The only vision build in WebLLM's prebuilt catalog (ModelType.VLM). Its compiled context
+  // is 4096 — an attached image costs ~2k tokens of it, which is why an image turn skips
+  // page context entirely (see App.tsx submit).
+  { id: 'Phi-3.5-vision-instruct-q4f16_1-MLC', label: 'Phi 3.5 Vision', approxGb: 3.9, maxCtx: 4096, safePromptTokens: 1536, note: 'Understands images', vision: true },
   { id: 'Llama-3.1-8B-Instruct-q4f16_1-MLC', label: 'Llama 3.1 8B', approxGb: 5.0, maxCtx: 8192, safePromptTokens: 1536, note: 'High quality' },
   { id: 'Qwen3-8B-q4f16_1-MLC', label: 'Qwen3 8B', approxGb: 5.7, maxCtx: 8192, safePromptTokens: 1536, note: 'Best, heaviest' },
 ];

@@ -35,6 +35,8 @@ export interface EngineHost<E, W> {
 export interface ModelLoader<E> {
   /** The resident engine, if any. */
   readonly engine: E | null;
+  /** What the resident engine is running, if any (null whenever `engine` is null). */
+  readonly loaded: { model: string; ctx: number } | null;
   /** The load currently in flight, if any. */
   readonly loading: { model: string; ctx: number } | null;
   /** Ensure the model+context is resident, joining or superseding any in-flight load. */
@@ -47,6 +49,7 @@ export function createModelLoader<E, W>(host: EngineHost<E, W>): ModelLoader<E> 
   let engine: E | null = null;
   let engineWorker: W | null = null;
   let loadedKey: string | null = null;
+  let loadedInfo: { model: string; ctx: number } | null = null;
   /** Serializes old-engine teardown so a new load never overlaps the GPU release. */
   let teardown: Promise<void> = Promise.resolve();
 
@@ -118,6 +121,7 @@ export function createModelLoader<E, W>(host: EngineHost<E, W>): ModelLoader<E> 
         engine = null;
         engineWorker = null;
         loadedKey = null;
+        loadedInfo = null;
         teardown = (async () => {
           try {
             await host.unloadEngine(oldEngine);
@@ -146,6 +150,7 @@ export function createModelLoader<E, W>(host: EngineHost<E, W>): ModelLoader<E> 
       engine = created;
       engineWorker = worker;
       loadedKey = key;
+      loadedInfo = { model, ctx };
     };
 
     load.promise = Promise.race([run(), cancelPromise]).finally(() => {
@@ -158,6 +163,9 @@ export function createModelLoader<E, W>(host: EngineHost<E, W>): ModelLoader<E> 
   return {
     get engine() {
       return engine;
+    },
+    get loaded() {
+      return loadedInfo;
     },
     get loading() {
       return active ? { model: active.model, ctx: active.ctx } : null;

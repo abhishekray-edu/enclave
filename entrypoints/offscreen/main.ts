@@ -4,7 +4,7 @@ import { browser } from 'wxt/browser';
 import type { WebWorkerMLCEngine } from '@mlc-ai/web-llm';
 import { createWebllmEngine, chatStreamWebllm, chatCompleteWebllm, isModelCached } from '@/lib/webllm';
 import { createModelLoader } from '@/lib/modelLoader';
-import { PORT_NAME, type OffscreenToPanel, type PanelToOffscreen, type WebllmPort } from '@/lib/webllmClient';
+import { PORT_NAME, webllmModel, type OffscreenToPanel, type PanelToOffscreen, type WebllmPort } from '@/lib/webllmClient';
 import { TtsPlayer } from '@/lib/ttsPlayer';
 import { MicCapture } from '@/lib/micCapture';
 // NOTE: lib/retrieval (Transformers.js + onnxruntime) and lib/compress (LLMLingua-2) run in
@@ -396,6 +396,9 @@ browser.runtime.onConnect.addListener((port) => {
       }
       abort = new AbortController();
       activeId = msg.id;
+      // Image content parts are only meaningful to a vision build; on any other model the
+      // engine mapping replaces them with a note (lib/webllm.ts toEngineMessages).
+      const vision = loader.loaded != null && webllmModel(loader.loaded.model).vision === true;
       try {
         if (msg.options.stream === false) {
           const content = await chatCompleteWebllm({
@@ -403,6 +406,7 @@ browser.runtime.onConnect.addListener((port) => {
             messages: msg.messages,
             options: msg.options,
             signal: abort.signal,
+            vision,
           });
           send(port, { type: 'result', id: msg.id, content });
           send(port, { type: 'done', id: msg.id });
@@ -412,6 +416,7 @@ browser.runtime.onConnect.addListener((port) => {
             messages: msg.messages,
             options: msg.options,
             signal: abort.signal,
+            vision,
           })) {
             send(port, { type: 'chunk', id: msg.id, delta });
           }

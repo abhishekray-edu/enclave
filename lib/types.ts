@@ -52,6 +52,13 @@ export interface ChatMessage {
   /** This assistant message is an error notice (content is the message) — rendered with a
    *  warning icon instead of as markdown. */
   error?: boolean;
+  /** Images attached to a user message (data: URLs, downscaled at attach time). Reach the
+   *  engine as image_url content parts when the loaded model supports vision
+   *  (lib/webllm.ts toEngineMessages). */
+  images?: string[];
+  /** Text files attached to a user message (content capped at attach time). Folded into the
+   *  message text at the engine boundary; shown as chips in the chat. */
+  files?: { name: string; text: string }[];
 }
 
 export type Theme = 'system' | 'light' | 'dark';
