@@ -116,11 +116,16 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string, onTime
   });
 }
 
+/** Capture failed because no readable page is there (chrome://, the Web Store, PDFs, local
+ *  files, or no active tab). Free-form questions degrade to a page-context-off turn on this
+ *  error instead of failing; page-dependent tasks still surface it. */
+class PageUnreadableError extends Error {}
+
 /** Capture the active tab's content. If the content script isn't present (e.g. the tab was
  *  open before the extension was installed/updated), inject it on demand and retry. */
 async function capturePage(wantViewport = false): Promise<PageContent> {
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id) throw new Error('No active tab.');
+  if (!tab?.id) throw new PageUnreadableError('No active tab.');
   const tabId = tab.id;
   const ask = () =>
     browser.tabs.sendMessage(tabId, {
@@ -139,7 +144,7 @@ async function capturePage(wantViewport = false): Promise<PageContent> {
       });
       return await ask();
     } catch {
-      throw new Error(
+      throw new PageUnreadableError(
         "Can't read this page. Restricted pages (chrome://, the Chrome Web Store, PDFs, and local files) can't be read.",
       );
     }
@@ -1170,25 +1175,37 @@ export default function App() {
       const sysOverride = opts?.fromVoice
         ? `${baseSys ?? s.systemPrompt}\n\n${VOICE_REPLY_DIRECTIVE}`
         : baseSys;
-      // Page context toggled off: nothing from the tab is captured or sent — the prompt is
-      // just the system scaffold plus the conversation.
       let page: PageContent | null = null;
       let built: BuiltPrompt;
-      if (!s.pageContext) {
-        built = buildMessages(s, null, conversation, runtimeCtx, {
-          systemPromptOverride: sysOverride,
-        });
-      } else {
+      if (s.pageContext) {
         setPageNote('Reading page…');
-        page = await withTimeout(
-          capturePage(s.viewportBoost),
-          PAGE_CAPTURE_TIMEOUT_MS,
-          'This page took too long to read. Heavy, app-like pages can do this — select the relevant text and try again.',
-        );
+        try {
+          page = await withTimeout(
+            capturePage(s.viewportBoost),
+            PAGE_CAPTURE_TIMEOUT_MS,
+            'This page took too long to read. Heavy, app-like pages can do this — select the relevant text and try again.',
+          );
+        } catch (e) {
+          // An unreadable page (chrome://, the Web Store, PDFs…) fails a free-form question
+          // softly: the turn degrades to page-context-off and the question is still answered.
+          // Page-dependent tasks (summarize/explain/extract) keep the error — without the
+          // page they could only invent. The capture timeout stays an error too: that page
+          // IS readable, and the "select the relevant text" advice is actionable.
+          if (spec.kind !== 'ask' || !(e instanceof PageUnreadableError)) throw e;
+          setPageNote("This page can't be read — answering without page context.");
+        }
         if (controller.signal.aborted) {
           setLastAssistant('_(stopped)_');
           return;
         }
+      }
+      // Page context off — or an unreadable page a question degraded past: nothing from the
+      // tab is sent; the prompt is just the system scaffold plus the conversation.
+      if (!page) {
+        built = buildMessages(s, null, conversation, runtimeCtx, {
+          systemPromptOverride: sysOverride,
+        });
+      } else {
         if (opts?.selectionOverride && !page.selection.trim()) {
           page.selection = opts.selectionOverride;
         }
