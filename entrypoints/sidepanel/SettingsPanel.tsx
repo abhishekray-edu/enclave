@@ -45,13 +45,15 @@ function Checkbox({
   checked,
   onChange,
   label,
+  title,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   label: string;
+  title?: string;
 }) {
   return (
-    <label className="flex items-center gap-2">
+    <label className="flex items-center gap-2" title={title}>
       <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
       <span className="text-zinc-600 dark:text-zinc-300">{label}</span>
     </label>
@@ -120,6 +122,13 @@ export function SettingsPanel({
         </select>
         <p className="mt-1 text-[10px] text-zinc-400">Downloads once, then runs from cache.</p>
       </label>
+
+      <Checkbox
+        checked={settings.autoLoadOnStartup}
+        onChange={(v) => onSave({ autoLoadOnStartup: v })}
+        label="Load models when the browser starts"
+        title="Warms the AI model — and the voice models, if you've used voice — into memory at browser launch so the first answer is instant. Only loads models already downloaded; uses memory while the browser is open."
+      />
 
       {/* Voice */}
       <div className="space-y-2.5 rounded-lg border border-zinc-200 p-2.5 dark:border-zinc-800">

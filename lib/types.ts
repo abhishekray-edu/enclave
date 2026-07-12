@@ -78,6 +78,10 @@ export interface Settings {
   webllmModel: string;
   /** In-browser context window (tokens). Higher uses more GPU memory; capped for stability. */
   webllmCtx: number;
+  /** Load the chat model — and the voice models (TTS/STT), if previously downloaded — into
+   *  memory when the browser starts (cache-only — never downloads). Off: models load on
+   *  first use of the panel. */
+  autoLoadOnStartup: boolean;
   /** Sampling temperature; low keeps answers grounded in the page. */
   temperature: number;
   /** Hidden system prompt prepended to every conversation. */
@@ -107,6 +111,7 @@ export const DEFAULT_SETTINGS: Settings = {
   theme: 'system',
   webllmModel: 'Qwen3-4B-q4f16_1-MLC',
   webllmCtx: DEFAULT_CONTEXT_TOKENS,
+  autoLoadOnStartup: false,
   temperature: 0.3,
   systemPrompt: SYSTEM_PROMPT,
   pageContext: true,

@@ -5,6 +5,7 @@ import {
   WEBLLM_MODELS,
   PORT_NAME,
   defaultModelForDevice,
+  effectiveContextWindow,
   webgpuAvailable,
   webllmModel,
   ensureOffscreen,
@@ -58,7 +59,6 @@ import { applyTheme } from '@/lib/theme';
 import {
   DEFAULT_SETTINGS,
   MAX_CONTEXT_TOKENS,
-  MIN_CONTEXT_TOKENS,
   type ChatMessage,
   type GetPageContentRequest,
   type PageContent,
@@ -172,7 +172,7 @@ function toPlainText(md: string): string {
 }
 
 function contextForSettings(s: Settings): number {
-  return Math.max(MIN_CONTEXT_TOKENS, Math.min(s.webllmCtx, MAX_CONTEXT_TOKENS, webllmModel(s.webllmModel).maxCtx));
+  return effectiveContextWindow(s.webllmModel, s.webllmCtx);
 }
 
 function isNearBottom(el: HTMLElement): boolean {

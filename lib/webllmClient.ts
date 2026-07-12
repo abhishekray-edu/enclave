@@ -1,7 +1,7 @@
 // Panel-side WebLLM client. Talks to the offscreen document that hosts the engine.
 // Deliberately imports NO @mlc-ai/web-llm code, so the side-panel bundle stays small.
 import { browser } from 'wxt/browser';
-import type { ChatMessage, Chunk, RetrievedChunk } from './types';
+import { MAX_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, type ChatMessage, type Chunk, type RetrievedChunk } from './types';
 
 export interface WebllmModelOption {
   id: string;
@@ -48,6 +48,13 @@ const LOW_MEMORY_MODEL_ID = 'Llama-3.2-3B-Instruct-q4f16_1-MLC';
 /** Look up a model option by id (falls back to the default model). */
 export function webllmModel(id: string): WebllmModelOption {
   return WEBLLM_MODELS.find((m) => m.id === id) ?? WEBLLM_MODELS.find((m) => m.id === DEFAULT_MODEL_ID)!;
+}
+
+/** Context window actually requested from the engine for a settings choice: the stored value
+ *  clamped to the model's cap and the global bounds. Every caller that loads or prewarms the
+ *  model must use this — the engine is keyed by (model, ctx), so a mismatch forces a reload. */
+export function effectiveContextWindow(modelId: string, requestedCtx: number): number {
+  return Math.max(MIN_CONTEXT_TOKENS, Math.min(requestedCtx, MAX_CONTEXT_TOKENS, webllmModel(modelId).maxCtx));
 }
 
 /** Suggested model for this machine. navigator.deviceMemory is coarse (Chromium caps it at
