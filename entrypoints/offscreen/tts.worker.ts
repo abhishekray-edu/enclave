@@ -15,6 +15,7 @@
 // deliberately NOT WebGPU, so it never contends with the WebLLM engine for the GPU.
 import * as ort from 'onnxruntime-web/wasm';
 import { SpUnigramTokenizer } from '@/lib/spTokenizer';
+import { TTS_ASSET_BASE, TTS_ASSETS, TTS_CACHE_NAME } from '@/lib/voiceCache';
 
 // ---- Message protocol (offscreen main.ts <-> this worker) ----
 interface LoadMsg { type: 'ttsLoad'; id: number }
@@ -29,24 +30,10 @@ type TtsWorkerRequest = LoadMsg | SpeakMsg | SpeakStreamMsg | AppendMsg | Finish
 //      Storage. Self-hosted in our OWN public HF repo (not a third-party Space) so availability
 //      and licensing are under our control — the weights are Kyutai pocket-tts under CC-BY-4.0,
 //      redistributed with attribution (see THIRD_PARTY_NOTICES.md). Regenerate/upload the repo
-//      contents with `node scripts/prepare-tts-assets.mjs`. ----
-// NOTE: set this to YOUR public Hugging Face repo (created from tts-assets/). Update the owner
-// if your HF username differs from the GitHub org.
-const TTS_ASSET_BASE = 'https://huggingface.co/team-edt/enclave-tts/resolve/main/';
-const CACHE_NAME = 'enclave-tts-v1';
-// mimi_encoder is intentionally absent — it's only needed for cloning a voice from audio.
-// Bytes are approximate (for the download progress bar); real Content-Length is used when present.
-const ASSETS: { file: string; bytes: number }[] = [
-  { file: 'bundle.json', bytes: 40_000 },
-  { file: 'text_conditioner_int8.onnx', bytes: 16_400_000 },
-  { file: 'flow_lm_main_int8.onnx', bytes: 76_300_000 },
-  { file: 'flow_lm_flow_int8.onnx', bytes: 10_000_000 },
-  { file: 'mimi_decoder_int8.onnx', bytes: 22_700_000 },
-  { file: 'voices.bin', bytes: 6_200_000 }, // alba only (CC-BY-4.0); was 52 MB with all voices
-  { file: 'tokenizer.model', bytes: 100_000 },
-  { file: 'bos_before_voice.npy', bytes: 5_000 },
-];
-const TOTAL_BYTES = ASSETS.reduce((a, b) => a + b.bytes, 0);
+//      contents with `node scripts/prepare-tts-assets.mjs`.
+//      Repo URL, cache name, and asset list live in lib/voiceCache.ts, shared with the
+//      background worker's cache-only startup warm-up. ----
+const TOTAL_BYTES = TTS_ASSETS.reduce((a, b) => a + b.bytes, 0);
 
 // ---- Loop constants (verbatim from the reference worker) ----
 const MAX_FRAMES = 500;
@@ -132,11 +119,11 @@ function configureOrt() {
 // ---- Fetch with Cache Storage + streamed progress ----
 async function fetchCached(file: string, onBytes: (delta: number) => void): Promise<ArrayBuffer> {
   const url = TTS_ASSET_BASE + file;
-  const cache = await caches.open(CACHE_NAME);
+  const cache = await caches.open(TTS_CACHE_NAME);
   const hit = await cache.match(url);
   if (hit) {
     const buf = await hit.arrayBuffer();
-    onBytes(ASSETS.find((a) => a.file === file)?.bytes ?? buf.byteLength);
+    onBytes(TTS_ASSETS.find((a) => a.file === file)?.bytes ?? buf.byteLength);
     return buf;
   }
   const res = await fetch(url);
@@ -378,7 +365,7 @@ async function load(id: number) {
   };
   const buffers: Record<string, ArrayBuffer> = {};
   // Sequential fetch keeps peak memory and the progress bar sane.
-  for (const a of ASSETS) buffers[a.file] = await fetchCached(a.file, bump);
+  for (const a of TTS_ASSETS) buffers[a.file] = await fetchCached(a.file, bump);
 
   bundleMeta = JSON.parse(new TextDecoder().decode(buffers['bundle.json'])) as BundleMeta;
   sampleRate = Number(bundleMeta.sample_rate);

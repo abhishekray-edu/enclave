@@ -1,4 +1,9 @@
 import type { PendingAction } from '@/lib/types';
+import { loadSettings } from '@/lib/settings';
+import { PORT_NAME, effectiveContextWindow, prewarmModel } from '@/lib/webllmClient';
+import { ttsLoad } from '@/lib/ttsClient';
+import { sttLoad } from '@/lib/sttClient';
+import { sttWeightsCached, ttsWeightsCached } from '@/lib/voiceCache';
 
 const MENU_ID = 'explain-selection';
 const PENDING_KEY = 'pendingAction';
@@ -38,7 +43,45 @@ async function releaseOffscreen() {
   if (await offscreen.hasDocument()) await offscreen.closeDocument();
 }
 
+/** Warm the models at browser launch when the setting is on: the chat model via the prewarm
+ *  path, then the voice models (TTS + STT) — each only if its weights are already on disk,
+ *  because a startup warm must never kick off a download the user didn't ask for.
+ *  The port exists just for these requests; the offscreen document keeps the models resident
+ *  after it closes, and the loads survive even if this worker is reaped mid-way. */
+async function prewarmOnStartup() {
+  try {
+    const settings = await loadSettings();
+    if (!settings.autoLoadOnStartup) return;
+    await ensureOffscreen();
+    const port = browser.runtime.connect({ name: PORT_NAME });
+    try {
+      // Chat model first — it loads on the GPU; the voice models are CPU-side workers and
+      // follow together once the GPU load settles.
+      await prewarmModel(
+        port,
+        settings.webllmModel,
+        effectiveContextWindow(settings.webllmModel, settings.webllmCtx),
+        () => {},
+      ).catch((e) => console.warn('Startup chat-model warm-up failed', e));
+      const [ttsCached, sttCached] = await Promise.all([ttsWeightsCached(), sttWeightsCached()]);
+      await Promise.all([
+        ttsCached && ttsLoad(port, () => {}).catch((e) => console.warn('Startup TTS warm-up failed', e)),
+        sttCached && sttLoad(port, () => {}).catch((e) => console.warn('Startup STT warm-up failed', e)),
+      ]);
+    } finally {
+      port.disconnect();
+    }
+  } catch (e) {
+    console.warn('Startup model warm-up failed', e);
+  }
+}
+
 export default defineBackground(() => {
+  // Browser launch: load the model into memory ahead of first use if the user opted in.
+  browser.runtime.onStartup.addListener(() => {
+    void prewarmOnStartup();
+  });
+
   // Clicking the toolbar icon opens the side panel.
   browser.sidePanel
     ?.setPanelBehavior({ openPanelOnActionClick: true })

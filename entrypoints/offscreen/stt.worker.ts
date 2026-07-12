@@ -17,6 +17,7 @@
 import * as ort from 'onnxruntime-web/wasm';
 import { pipeline, type AutomaticSpeechRecognitionPipeline } from '@huggingface/transformers';
 import { configureOrtRuntime } from '@/lib/ortEnv';
+import { MOONSHINE_MODEL } from '@/lib/voiceCache';
 import { VadFrameProcessor, VAD_FRAME_SAMPLES, DEFAULT_VAD_OPTIONS, pauseMsToRedemptionFrames } from '@/lib/vadFrameProcessor';
 
 // ---- Message protocol (offscreen main.ts <-> this worker) ----
@@ -46,7 +47,6 @@ const BASE_ONSET = {
 // Silero VAD is vendored in the extension (public/vad/); Moonshine's weights are fetched once
 // from the Hugging Face CDN and auto-cached by transformers.js (like the embedding model).
 const SILERO_URL = 'vad/silero_vad_v5.onnx';
-const MOONSHINE_MODEL = 'onnx-community/moonshine-base-ONNX';
 // Per-file dtypes, both verified: q8/int8 DECODER files fail session creation under the bundled
 // onnxruntime-web ("TransposeDQWeightsForMatMulNBits Missing required scale ..." — a QDQ
 // transform bug this runtime hits on those exports; onnxruntime-node loads them fine). The q4

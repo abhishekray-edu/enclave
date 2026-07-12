@@ -1,7 +1,7 @@
 // Panel-side WebLLM client. Talks to the offscreen document that hosts the engine.
 // Deliberately imports NO @mlc-ai/web-llm code, so the side-panel bundle stays small.
 import { browser } from 'wxt/browser';
-import type { ChatMessage, Chunk, RetrievedChunk } from './types';
+import { MAX_CONTEXT_TOKENS, MIN_CONTEXT_TOKENS, type ChatMessage, type Chunk, type RetrievedChunk } from './types';
 
 export interface WebllmModelOption {
   id: string;
@@ -22,6 +22,8 @@ export interface WebllmModelOption {
   safePromptTokens: number;
   /** Short tier note shown in the picker. */
   note: string;
+  /** Model can see images: user messages may carry image_url content parts. */
+  vision?: boolean;
 }
 
 /** RAM-tiered in-browser models — ids, memory, and per-model context caps verified
@@ -37,6 +39,10 @@ export const WEBLLM_MODELS: WebllmModelOption[] = [
   // caps are sized for tolerable freeze windows, not just crash safety. 4B at ~1536 tokens
   // keeps the single prefill slab (compiled chunk 2048) short even in Low Power Mode.
   { id: 'Qwen3-4B-q4f16_1-MLC', label: 'Qwen3 4B', approxGb: 3.4, maxCtx: 16384, safePromptTokens: 1536, note: 'Recommended' },
+  // The only vision build in WebLLM's prebuilt catalog (ModelType.VLM). Its compiled context
+  // is 4096 — an attached image costs ~2k tokens of it, which is why an image turn skips
+  // page context entirely (see App.tsx submit).
+  { id: 'Phi-3.5-vision-instruct-q4f16_1-MLC', label: 'Phi 3.5 Vision', approxGb: 3.9, maxCtx: 4096, safePromptTokens: 1536, note: 'Understands images', vision: true },
   { id: 'Llama-3.1-8B-Instruct-q4f16_1-MLC', label: 'Llama 3.1 8B', approxGb: 5.0, maxCtx: 8192, safePromptTokens: 1536, note: 'High quality' },
   { id: 'Qwen3-8B-q4f16_1-MLC', label: 'Qwen3 8B', approxGb: 5.7, maxCtx: 8192, safePromptTokens: 1536, note: 'Best, heaviest' },
 ];
@@ -48,6 +54,13 @@ const LOW_MEMORY_MODEL_ID = 'Llama-3.2-3B-Instruct-q4f16_1-MLC';
 /** Look up a model option by id (falls back to the default model). */
 export function webllmModel(id: string): WebllmModelOption {
   return WEBLLM_MODELS.find((m) => m.id === id) ?? WEBLLM_MODELS.find((m) => m.id === DEFAULT_MODEL_ID)!;
+}
+
+/** Context window actually requested from the engine for a settings choice: the stored value
+ *  clamped to the model's cap and the global bounds. Every caller that loads or prewarms the
+ *  model must use this — the engine is keyed by (model, ctx), so a mismatch forces a reload. */
+export function effectiveContextWindow(modelId: string, requestedCtx: number): number {
+  return Math.max(MIN_CONTEXT_TOKENS, Math.min(requestedCtx, MAX_CONTEXT_TOKENS, webllmModel(modelId).maxCtx));
 }
 
 /** Suggested model for this machine. navigator.deviceMemory is coarse (Chromium caps it at

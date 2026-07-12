@@ -52,6 +52,13 @@ export interface ChatMessage {
   /** This assistant message is an error notice (content is the message) — rendered with a
    *  warning icon instead of as markdown. */
   error?: boolean;
+  /** Images attached to a user message (data: URLs, downscaled at attach time). Reach the
+   *  engine as image_url content parts when the loaded model supports vision
+   *  (lib/webllm.ts toEngineMessages). */
+  images?: string[];
+  /** Text files attached to a user message (content capped at attach time). Folded into the
+   *  message text at the engine boundary; shown as chips in the chat. */
+  files?: { name: string; text: string }[];
 }
 
 export type Theme = 'system' | 'light' | 'dark';
@@ -78,6 +85,10 @@ export interface Settings {
   webllmModel: string;
   /** In-browser context window (tokens). Higher uses more GPU memory; capped for stability. */
   webllmCtx: number;
+  /** Load the chat model — and the voice models (TTS/STT), if previously downloaded — into
+   *  memory when the browser starts (cache-only — never downloads). Off: models load on
+   *  first use of the panel. */
+  autoLoadOnStartup: boolean;
   /** Sampling temperature; low keeps answers grounded in the page. */
   temperature: number;
   /** Hidden system prompt prepended to every conversation. */
@@ -107,6 +118,7 @@ export const DEFAULT_SETTINGS: Settings = {
   theme: 'system',
   webllmModel: 'Qwen3-4B-q4f16_1-MLC',
   webllmCtx: DEFAULT_CONTEXT_TOKENS,
+  autoLoadOnStartup: false,
   temperature: 0.3,
   systemPrompt: SYSTEM_PROMPT,
   pageContext: true,
